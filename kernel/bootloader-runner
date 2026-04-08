@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# Custom kernel runner for multiboot kernel with proper linker script
+
+set -e
+
+# Get the arguments
+BIN_NAME="$1"
+shift
+
+# Path to the kernel binary
+KERNEL_BIN="target/x86_64-unknown-none/release/$BIN_NAME"
+
+# Build the kernel with our custom linker script
+echo "Building kernel with multiboot support..."
+RUSTFLAGS="-C link-arg=-Tsrc/linker.ld" cargo build -Z build-std=core,compiler_builtins --target x86_64-unknown-none --release --bin "$BIN_NAME"
+
+echo "Built kernel at: $KERNEL_BIN"
+echo "File type:"
+file "$KERNEL_BIN"
+
+echo ""
+echo "ELF header (first 64 bytes):"
+hexdump -C "$KERNEL_BIN" | head -2
+
+echo ""
+echo "Checking for multiboot header..."
+if readelf -n "$KERNEL_BIN" | grep -q MULTIBOOT; then
+    echo "✓ Multiboot header found"
+else
+    echo "✗ Multiboot header not found"
+fi
+
+echo ""
+echo "Kernel symbols:"
+nm "$KERNEL_BIN" | head -10

@@ -1,0 +1,10 @@
+[build]
+target = "x86_64-unknown-none"
+
+[link]
+# Set the entry point for the kernel
+entry-point = "_start"
+
+[unstable]
+build-std-features = ["compiler-builtins-mem"]
+build-std = ["core", "compiler_builtins"]

@@ -1,0 +1,35 @@
+# Rust / Cargo
+target/
+kernel/target_rel/
+**/*.rs.bk
+
+# Keep Cargo.lock tracked for applications/binaries.
+# If you publish a reusable library, you can ignore it by uncommenting:
+# Cargo.lock
+
+# Build/debug artifacts
+kernel/boot.o
+*.pdb
+
+# Tooling and editors
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local env/config
+.env
+.env.*
+!.env.example
+
+# Project-specific
+.gsd/
+.gsd
+.gsd-id
+tmp/
