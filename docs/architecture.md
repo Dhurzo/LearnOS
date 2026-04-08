@@ -4,13 +4,14 @@
 
 This is a minimal x86_64 operating system kernel written in Rust, targeting a `no_std` bare-metal environment. The kernel boots via PVH (modern QEMU) or a traditional BIOS boot sector, writes "Hello World!" directly to the VGA text buffer, and halts in an infinite loop.
 
-There are no external dependencies, no allocator, and no standard library. The entire kernel is a single Rust source file (`kernel/src/main.rs`) plus assembly boot stubs and a linker script.
+There are no external dependencies, no allocator, and no standard library. The kernel logic is split across two Rust files (`kernel/src/main.rs` and `kernel/src/vga.rs`) plus assembly boot stubs and a linker script.
 
 ## Source Files
 
 | File | Purpose |
 |------|---------|
-| `kernel/src/main.rs` | Kernel entry point, VGA output, PVH note, panic handler |
+| `kernel/src/main.rs` | Kernel entry point, PVH note, panic handler |
+| `kernel/src/vga.rs` | VGA text-mode writing logic |
 | `kernel/src/boot.asm` | 16-bit NASM boot sector (BIOS fallback) |
 | `kernel/src/boot.S` | Multiboot2 header (GNU as assembly) |
 | `kernel/src/linker.ld` | Linker script — memory layout at 2MB, binary output format |
@@ -22,7 +23,7 @@ There are no external dependencies, no allocator, and no standard library. The e
 1. QEMU loads the raw kernel binary directly using the `-kernel` flag
 2. QEMU detects the `.note.pvh` ELF note section and boots in PVH mode
 3. Execution begins at `_start()` in `main.rs`
-4. `_start()` calls `print_vga("Hello World!")` which writes to VGA memory
+4. `_start()` calls `vga::print_vga("Hello World!")` which writes to VGA memory
 5. The kernel enters `loop {}` and runs indefinitely
 
 ### Boot Sector Mode (recommended path in this repo)
@@ -43,7 +44,7 @@ The `boot.S` file contains a Multiboot2 header stub (magic `0xe85250d6`) in the 
 ```rust
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    print_vga("Hello World!");
+    vga::print_vga("Hello World!");
     loop {}
 }
 ```
@@ -112,7 +113,7 @@ Loading at 2MB avoids the first megabyte (BIOS, bootloader, VGA memory) and prov
 ## Design Philosophy
 
 ### Minimalism
-- Single source file, zero external dependencies
+- Two small source files, zero external dependencies
 - Direct hardware access — no abstraction layers
 - Two boot methods covering modern (PVH) and legacy (BIOS) paths
 
@@ -124,4 +125,4 @@ Loading at 2MB avoids the first megabyte (BIOS, bootloader, VGA memory) and prov
 ### Extensibility
 - The linker script reserves standard ELF sections (`.text`, `.data`, `.bss`) for future expansion
 - The PVH note and multiboot header are isolated in their own sections
-- Adding interrupt handling, memory management, or drivers would extend `main.rs` or add new modules
+- Core output logic is isolated in `vga.rs`, making future drivers easier to add

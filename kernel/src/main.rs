@@ -89,132 +89,9 @@
 
 use core::panic::PanicInfo;
 
+mod vga;
+
 core::arch::global_asm!(include_str!("boot.S"));
-
-// Constants for VGA text mode
-/// VGA text buffer base address
-///
-/// Physical memory address: 0xB8000
-/// This is the standard address for VGA text mode in 80x25 resolution.
-/// The buffer is organized as pairs of bytes:
-/// - Even position (0, 2, 4...): ASCII character code
-/// - Odd position (1, 3, 5...): Color attribute byte
-///
-/// Each character cell occupies 2 bytes:
-/// ```
-/// [Character][Color] [Character][Color] ...
-/// ```
-///
-/// Memory layout:
-/// 0xB8000: Row 1, Column 1
-/// 0xB8002: Row 1, Column 2
-/// ...
-/// 0xB8FA0: Row 25, Column 80 (last cell)
-///
-/// Color Attribute Byte Format:
-/// ```
-/// Bit:     7    6    5    4    3    2    1    0
-///         B    G    R    B    G    R    I    B
-///         Foreground Color    Background Color     Blink
-/// ```
-///
-/// Foreground/Background Color Bits:
-/// - Bits 0-2: Blue, Green, Red (foreground)
-/// - Bits 4-6: Blue, Green, Red (background)
-/// - Bit 3:   Intensity (bright/dark)
-/// - Bit 7:   Blink (enabled when set)
-///
-/// Color Values:
-/// - 0x0F: White text on black background (default)
-/// - 0x0C: Red text on black background
-/// - 0x70: White text on blue background
-const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
-
-/// VGA color attribute: White text on black background
-///
-/// Value: 0x0F in binary: 00001111
-/// - Bits 0-2: 111 (Blue=1, Green=1, Red=1) = White foreground
-/// - Bit 3:    1 (Intensity) = Bright
-/// - Bits 4-6: 000 (Blue=0, Green=0, Red=0) = Black background  
-/// - Bit 7:    0 (Blink) = Disabled
-const VGA_COLOR_WHITE: u8 = 0x0f;
-
-/// Print text to VGA text buffer
-///
-/// This function writes a string directly to the VGA text buffer at address 0xB8000.
-/// It implements basic text output without using any standard library functions.
-///
-/// # Arguments
-/// * `s` - The string to print (UTF-8 encoded)
-///
-/// # Technical Details
-///
-/// The VGA text buffer is organized as an array of character cells, where each cell
-/// consists of 2 bytes:
-///
-/// ```
-/// [Byte 0: ASCII Character][Byte 1: Color Attribute]
-/// ```
-///
-/// Memory Layout:
-/// - Start address: 0xB8000 (physical memory)
-/// - Screen size: 80 columns × 25 rows = 2000 character cells
-/// - Total size: 4000 bytes (2000 cells × 2 bytes each)
-/// - Each row: 160 bytes (80 columns × 2 bytes)
-/// - Address calculation: 0xB8000 + (row × 160) + (column × 2)
-///
-/// # Implementation Notes
-///
-/// ### Safety Considerations
-/// - Uses `unsafe` block because we're writing directly to memory
-/// - No bounds checking (relies on string length)
-/// - No synchronization with display hardware
-///
-/// # Function Behavior
-/// - Starts writing at current cursor position (relative to VGA buffer base)
-/// - Does not advance cursor between characters (caller responsibility)
-/// - Does not wrap around screen edges (caller responsibility)
-/// - Does not handle special characters like newlines or tabs
-/// - Prints up to 255 characters per call (system limit)
-///
-/// # Performance Considerations
-/// - Linear time complexity: O(n) where n = string length
-/// - Each character write generates a memory store operation
-/// - No hardware acceleration: direct memory writes
-/// - Cache-friendly sequential memory access pattern
-///
-/// # Error Handling
-/// - No error handling: buffer overflow could corrupt memory
-/// - Invalid ASCII characters: undefined behavior (may display as garbage)
-/// - Non-ASCII UTF-8: will display as replacement character or garbage
-///
-/// # Examples
-///
-/// Basic usage:
-/// ```
-/// print_vga("Hello World!");
-/// // Writes: H e l l o   W o r l d ! with white color
-/// ```
-///
-/// Color usage:
-/// ```
-/// const COLOR_RED: u8 = 0x0C;     // Red text on black
-/// const COLOR_GREEN: u8 = 0x0A;   // Green text on black
-/// const COLOR_BLUE: u8 = 0x01;    // Blue text on black
-/// const COLOR_YELLOW: u8 = 0x0E;   // Yellow text on black (bright)
-/// ```
-fn print_vga(s: &str) {
-    let mut i = 0;
-    for &byte in s.as_bytes() {
-        unsafe {
-            // Write character to even position (character byte)
-            *VGA_BUFFER.offset(i as isize * 2) = byte;
-            // Write color attribute to odd position (color byte)
-            *VGA_BUFFER.offset(i as isize * 2 + 1) = VGA_COLOR_WHITE;
-        }
-        i += 1;
-    }
-}
 
 /// PVH (Para-Virtualized Hypervisor) note for modern QEMU support
 ///
@@ -264,7 +141,7 @@ static PVH_NOTE: Elf64Note = Elf64Note {
 #[no_mangle] // Don't mangle the symbol name
 pub extern "C" fn _start() -> ! {
     // Print "Hello World!" to the VGA buffer
-    print_vga("Hello World!");
+    vga::print_vga("Hello World!");
 
     // Infinite loop to keep the kernel running
     // In a real kernel, this would be replaced with proper scheduling
