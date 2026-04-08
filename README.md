@@ -1,17 +1,17 @@
-# LearnOS - PVH + VGA Rust Kernel
+# LearnOS - PVH + VGA Rust Kernel 🚀
 
 Minimal x86_64 kernel in Rust (`no_std`) that boots in QEMU through PVH, switches to long mode in an assembly bootstrap, writes text to the classic VGA text buffer (`0xb8000`), and echoes keyboard input from the PS/2 controller.
 
-## What This Project Demonstrates
+## 📋 Project Overview
 
-- Bare-metal Rust kernel with custom entrypoint (`_start`) and panic handler
-- PVH boot through a Xen ELF note (`XEN_ELFNOTE_PHYS32_ENTRY`)
-- 32-bit to 64-bit transition in `kernel/src/boot.S`
-- Identity paging setup for low memory and kernel region
-- Direct VGA text-mode writes (memory-mapped I/O)
-- Direct keyboard polling from ports `0x64` and `0x60`
+- ✅ Bare-metal Rust kernel with custom entrypoint (`_start`) and panic handler
+- ✅ PVH boot through a Xen ELF note (`XEN_ELFNOTE_PHYS32_ENTRY`)
+- ✅ 32-bit to 64-bit transition in `kernel/src/boot.S`
+- ✅ Identity paging setup for low memory and kernel region
+- ✅ Direct VGA text-mode writes (memory-mapped I/O)
+- ✅ Direct keyboard polling from ports `0x64` and `0x60`
 
-## Current Boot Model
+## 🚀 Current Boot Model
 
 This repository uses one runtime path:
 
@@ -19,7 +19,7 @@ This repository uses one runtime path:
 
 There is no BIOS boot-sector runtime path in the active workflow.
 
-## Repository Layout
+## 🏗️ Repository Layout
 
 - `kernel/src/main.rs` - Rust kernel entry (`_start`), line editor loop, panic handler
 - `kernel/src/boot.S` - PVH entry note and 32-bit bootstrap to long mode
@@ -31,7 +31,7 @@ There is no BIOS boot-sector runtime path in the active workflow.
 - `verify.sh` - ELF/PVH note quick verification
 - `test.sh` - Boot smoke test with timeout
 
-## Build
+## 🛠️ Build
 
 Prerequisites:
 
@@ -52,7 +52,7 @@ Output:
 
 - `target/pvh-kernel` (ELF64 ET_EXEC with Xen PVH note)
 
-## Run
+## 🤖 Run
 
 Recommended interactive run (VGA window + keyboard focus):
 
@@ -72,7 +72,7 @@ Debug run (QEMU debug flags + nographic):
 ./run.sh --debug --timeout 5
 ```
 
-## Expected Behavior
+## 🔩 Run Expected Behavior
 
 After boot handoff, the kernel clears the screen and prints:
 
@@ -90,14 +90,14 @@ Echo: <line>
 > 
 ```
 
-## Verify
+## 🧪 Verify
 
 ```bash
 ./verify.sh
 ./test.sh --timeout 5
 ```
 
-## Notes
+## 📝 Notes
 
 - VGA output requires the QEMU graphical window (`run.sh` defaults to GUI mode).
 - In `-nographic`, VGA memory writes are not visible on terminal.
