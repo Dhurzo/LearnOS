@@ -1,179 +1,104 @@
-# OS Kernel Project - Hello World Kernel 🚀
+# LearnOS - PVH + VGA Rust Kernel
 
-An operating system kernel project that demonstrates "Hello World!" output in QEMU using Rust.
+Minimal x86_64 kernel in Rust (`no_std`) that boots in QEMU through PVH, switches to long mode in an assembly bootstrap, writes text to the classic VGA text buffer (`0xb8000`), and echoes keyboard input from the PS/2 controller.
 
-## 📋 Project Overview
+## What This Project Demonstrates
 
-This project implements a basic x86_64 kernel that:
-- ✅ Compiles as a `no_std` Rust executable
-- ✅ Includes PVH note for modern QEMU compatibility
-- ✅ Displays "Hello World!" using VGA buffer
-- ✅ Supports modern features like PVH for QEMU
-- ✅ Includes verification scripts and testing utilities
+- Bare-metal Rust kernel with custom entrypoint (`_start`) and panic handler
+- PVH boot through a Xen ELF note (`XEN_ELFNOTE_PHYS32_ENTRY`)
+- 32-bit to 64-bit transition in `kernel/src/boot.S`
+- Identity paging setup for low memory and kernel region
+- Direct VGA text-mode writes (memory-mapped I/O)
+- Direct keyboard polling from ports `0x64` and `0x60`
 
-## 🏗️ Kernel Architecture
+## Current Boot Model
 
-### Main Components:
+This repository uses one runtime path:
 
-1. **`kernel/src/main.rs`** - Kernel entry point with multiboot header
-2. **`kernel/src/linker.ld`** - Linker script defining memory layout
-3. **`kernel/Cargo.toml`** - Build configuration for no_std compilation
-4. **`scripts/verify-boot.sh`** - Multiboot format verification script
-5. **`target/boot.img`** - Bootable disk image for QEMU
+- `qemu-system-x86_64 -kernel target/pvh-kernel ...`
 
-### Implemented Features:
+There is no BIOS boot-sector runtime path in the active workflow.
 
-- **Multiboot2 Stub**: Assembly header source for GRUB/multiboot experiments
-- **PVH Support**: PVH note for modern QEMU support
-- **VGA Output**: Direct printing to VGA buffer (0xb8000)
-- **Boot Sector**: Simple boot alternative for QEMU
-- **Build Pipeline**: Compilation with nightly Rust and build-std
+## Repository Layout
 
-## 🛠️ Build Instructions
+- `kernel/src/main.rs` - Rust kernel entry (`_start`), line editor loop, panic handler
+- `kernel/src/boot.S` - PVH entry note and 32-bit bootstrap to long mode
+- `kernel/src/vga.rs` - VGA text writer (clear, write byte, backspace, print)
+- `kernel/src/keyboard.rs` - PS/2 scan-code polling and decode table
+- `kernel/src/linker.ld` - ELF layout and section placement
+- `build.sh` - Build script for PVH kernel artifact
+- `run.sh` - QEMU launcher (GUI by default, interactive by default)
+- `verify.sh` - ELF/PVH note quick verification
+- `test.sh` - Boot smoke test with timeout
 
-### Prerequisites
+## Build
+
+Prerequisites:
 
 ```bash
-# Install Rust nightly (required for no_std)
 rustup install nightly
-rustup default nightly
-
-# Install required tools
-sudo apt install qemu-system-x86_64 nasm
+rustup target add x86_64-unknown-none --toolchain nightly
+rustup component add rust-src llvm-tools-preview --toolchain nightly
+sudo apt install qemu-system-x86_64
 ```
 
-### Kernel Compilation
+Build artifact:
 
 ```bash
-# Build the kernel (from project root)
-RUSTFLAGS="-C link-arg=-Tkernel/src/linker.ld" \
-    cargo +nightly build -Z build-std=core,compiler_builtins \
-    --target x86_64-unknown-none \
-    --release --bin kernel
-
-# Create boot image (working boot method)
 ./build.sh
-
 ```
 
-### Format Verification
+Output:
+
+- `target/pvh-kernel` (ELF64 ET_EXEC with Xen PVH note)
+
+## Run
+
+Recommended interactive run (VGA window + keyboard focus):
 
 ```bash
-# Verify raw kernel markers (PVH + multiboot magic)
+./run.sh --interactive
+```
+
+Quick timeout run:
+
+```bash
+./run.sh --timeout 5
+```
+
+Debug run (QEMU debug flags + nographic):
+
+```bash
+./run.sh --debug --timeout 5
+```
+
+## Expected Behavior
+
+After boot handoff, the kernel clears the screen and prints:
+
+```text
+Hello World!
+Keyboard echo demo
+Type text and press Enter
+> 
+```
+
+Typing and pressing Enter prints:
+
+```text
+Echo: <line>
+> 
+```
+
+## Verify
+
+```bash
 ./verify.sh
-
-# Verify boot image
-./scripts/verify-boot.sh
+./test.sh --timeout 5
 ```
 
-### Method 2: PVH (`-kernel`) (Experimental)
+## Notes
 
-```bash
-timeout 10s qemu-system-x86_64 \
-    -kernel target/pvh-kernel \
-    -m 128M \
-    -machine q35,accel=kvm:tcg \
-    -cpu host \
-    -nographic
-```
-
-Use Method 1 for the most reliable educational demo path.
-
-## 🚀 QEMU Execution
-
-### Method 1: Boot Sector (Recommended)
-
-```bash
-# Run bootable disk image (shows "Hello World!")
-timeout 10s qemu-system-x86_64 \
-    -drive format=raw,file=target/boot.img \
-    -boot order=a \
-    -m 32 \
-    -nographic
-```
-
-## 🔍 Project Structure
-
-```
-.
-├── kernel/                    # Código fuente del kernel
-│   ├── src/
-│   │   ├── main.rs           # Punto de entrada con multiboot header
-│   │   └── linker.ld         # Script de linker
-│   └── Cargo.toml           # Configuración de Rust
-├── scripts/                  # Scripts de utilidad
-│   └── verify-boot.sh       # Verificación multiboot
-├── target/                   # Archivos generados
-│   ├── boot.img             # Imagen de disco bootable
-│   ├── pvh-kernel           # Kernel con soporte PVH
-│   └── boot-sector.bin      # Boot sector binario
-└── README.md                # Este archivo
-```
-
-## 🧪 Testing and Verification
-
-### Verification Commands
-
-```bash
-# Verify boot image format/signature
-./scripts/verify-boot.sh
-
-# Verify raw kernel markers
-./verify.sh
-```
-
-### Expected Output
-
-When running the kernel, you should see:
-1. SeaBIOS screen at startup
-2. "Hello World!" printed on screen
-3. QEMU stops after 10 seconds
-
-## 🔧 Developing with This Project
-
-### Adding Features
-
-1. **VGA Mode**: VGA buffer is at `0xb8000`
-2. **Multiboot Stub**: Header source in `kernel/src/boot.S`
-3. **PVH Support**: Note in `.note.pvh` section
-4. **Entry Point**: `_start()` entry function
-
-### Debugging
-
-```bash
-# Build with debugging information
-RUSTFLAGS="-C link-arg=-Tsrc/linker.ld -g" \
-    cargo +nightly build -Z build-std=core,compiler_builtins \
-    --target x86_64-unknown-none --release --bin kernel
-```
-
-## 📚 Additional Resources
-
-### Multiboot Specification
-- [Multiboot Specification](https://www.gnu.org/software/grub/manual/multiboot/multiboot.html)
-- [PVH Boot for QEMU](https://www.qemu.org/docs/master/system/qemu-manpage.html)
-
-### Rust for Kernel Development
-- [The Rust Embedded Book](https://docs.rust-embedded.org/book/)
-- [no_std in Rust](https://doc.rust-lang.org/reference/no_std.html)
-
-### QEMU for Kernel Development
-- [QEMU System Emulation](https://www.qemu.org/docs/master/system/index.html)
-- [QEMU Boot Options](https://www.qemu.org/docs/master/system/qemu-manpage.html)
-
-## 🤝 Contributions
-
-This project is designed as an educational resource. Feel free to:
-
-1. Extend the kernel with more features
-2. Add explanatory comments
-3. Improve documentation
-4. Add new examples
-
-## 📄 License
-
-This project is open source and intended for educational purposes. MIT Licence
-
----
-
-**Happy Hacking! 🎉**
+- VGA output requires the QEMU graphical window (`run.sh` defaults to GUI mode).
+- In `-nographic`, VGA memory writes are not visible on terminal.
+- Keyboard input is polling-based (no IRQ/IDT yet), intentionally simple for early kernel bring-up.
