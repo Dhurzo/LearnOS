@@ -2,7 +2,6 @@
 target = "x86_64-unknown-none"
 
 [link]
-# Set the entry point for the kernel
 entry-point = "_start"
 
 [unstable]

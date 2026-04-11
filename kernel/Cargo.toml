@@ -3,12 +3,8 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
-# Description of the kernel package
 description = "A minimal x86_64 kernel written in Rust with PVH support"
 
-# Dependencies section
-# In this minimal kernel, we don't use any external dependencies
-# to keep the kernel lightweight and self-contained
 [dependencies]
 
 [profile.release]
@@ -17,3 +13,7 @@ panic = "abort"
 [profile.release.build-std]
 target = "x86_64-unknown-none"
 features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+linker-flavor = "ld.lld"

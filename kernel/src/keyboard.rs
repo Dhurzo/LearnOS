@@ -44,6 +44,21 @@ pub(crate) enum KeyEvent {
     Backspace,
 }
 
+/// Non-blocking poll for key events. Returns None if no key is available.
+pub(crate) fn poll_keyboard() -> Option<KeyEvent> {
+    // Check if data is available
+    let status = inb(KBD_STATUS_PORT);
+    if status & STATUS_OUTPUT_FULL != 0 {
+        let scancode = inb(KBD_DATA_PORT);
+        // Ignore release events (bit 7 set)
+        if scancode & 0x80 != 0 {
+            return None;
+        }
+        return decode_scancode(scancode);
+    }
+    None
+}
+
 /// Block until a supported key press is available.
 ///
 /// Release scan codes are ignored.
