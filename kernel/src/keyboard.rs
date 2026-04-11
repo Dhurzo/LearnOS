@@ -1,93 +1,126 @@
-//! Minimal PS/2 keyboard input (polling mode).
+//! PS/2 Keyboard Driver (Polling Mode)
 //!
-//! This module reads scan code set 1 from the legacy i8042 controller using
-//! I/O ports:
-//! - `0x64`: status register
-//! - `0x60`: data register
+//! This module implements a minimal driver for the legacy PS/2 keyboard controller.
+//! It operates in **polling mode**, meaning it actively checks the hardware for input
+//! rather than relying on interrupts.
 //!
-//! It is intentionally small and supports the keys needed for basic line input.
+//! ## Hardware Interface
 //!
-//! ## Why polling?
+//! The driver communicates with the i8042 PS/2 controller via x86 port-mapped I/O:
+//! - **Status Register (Read)**: Port `0x64`
+//! - **Data Register (Read/Write)**: Port `0x60`
 //!
-//! In a full kernel, keyboard input is usually interrupt-driven (IRQ1 + IDT/PIC).
-//! This project uses polling to keep early bring-up simple:
-//! - no interrupt descriptor table yet,
-//! - no PIC remapping/unmasking logic,
-//! - deterministic control flow during initial hardware learning.
+//! ## Microkernel Context
 //!
-//! ## Scan code model
+//! In a monolithic kernel, this code would run in the kernel address space.
+//! In this microkernel implementation, this module acts as the **Keyboard Service**.
+//! The `poll_keyboard()` function is called by the kernel dispatcher to retrieve
+//! input events which are then converted into `KeyEvent` messages for the system.
 //!
-//! This implementation assumes PS/2 scan code set 1 as provided by QEMU's
-//! legacy-compatible keyboard path. Only *make* codes (key press) are handled.
-//! *Break* codes (key release) are identified by bit 7 set and ignored.
+//! ## Design Decisions
 //!
-//! ## Safety boundaries
+//! 1.  **Polling vs Interrupts**:
+//!     Using interrupts requires setting up the Programmable Interrupt Controller (PIC)
+//!     and an Interrupt Descriptor Table (IDT). For this minimal kernel, polling keeps
+//!     the boot process simple and deterministic.
 //!
-//! Unsafety is fully contained in `inb` where inline assembly performs
-//! privileged port I/O. All callers operate through safe Rust APIs.
+//! 2.  **Scan Code Set 1**:
+//!     We assume the standard PS/2 scan code set 1 (used by most modern emulators like QEMU).
+//!     Only "make" codes (key press) are handled. "Break" codes (key release, indicated by
+//!     bit 7 in the scancode) are ignored.
+//!
+//! 3.  **US Layout Subset**:
+//!     Only a subset of US keys are mapped to ASCII. Features like Shift, CapsLock, and
+//!     AltGr are not implemented yet.
+//!
+//! ## Safety
+//!
+//! This module contains unsafe code:
+//! - `inb`: Inline assembly for reading from I/O ports.
+//! All public interfaces (`poll_keyboard`, `read_key_blocking`) are safe, encapsulating this unsafety.
 
 use core::arch::asm;
 use core::hint::spin_loop;
 
+/// I/O port for the PS/2 controller data register.
 const KBD_DATA_PORT: u16 = 0x60;
+
+/// I/O port for the PS/2 controller status register.
 const KBD_STATUS_PORT: u16 = 0x64;
-/// Status register bit 0: output buffer full (controller has data for CPU).
+
+/// Bit 0 of the Status Register: Output Buffer Full.
+/// If set, the controller has data ready for the CPU to read.
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 
-/// Decoded keyboard events used by the kernel line editor.
-pub(crate) enum KeyEvent {
-    /// Printable ASCII byte.
+/// High-level key events returned by the driver.
+///
+/// These events are processed by the kernel dispatcher and potentially
+/// converted into IPC messages.
+#[derive(Clone, Copy)]
+pub enum KeyEvent {
+    /// A printable character byte.
     Char(u8),
-    /// Enter/Return key.
+    /// The Enter (Return) key.
     Enter,
-    /// Backspace key.
+    /// The Backspace (Delete) key.
     Backspace,
 }
 
-/// Non-blocking poll for key events. Returns None if no key is available.
+/// Polls the keyboard for input without blocking.
+///
+/// This function checks the controller status register. If data is available,
+/// it reads and decodes the scan code. If no data is available, it returns immediately.
+///
+/// # Returns
+///
+/// - `Some(KeyEvent)` if a key was pressed and decoded.
+/// - `None` if no data was available or the event was ignored (e.g., key release).
 pub(crate) fn poll_keyboard() -> Option<KeyEvent> {
-    // Check if data is available
+    // 1. Check if the output buffer contains data
     let status = inb(KBD_STATUS_PORT);
     if status & STATUS_OUTPUT_FULL != 0 {
+        // 2. Read the scan code from the data port
         let scancode = inb(KBD_DATA_PORT);
-        // Ignore release events (bit 7 set)
+
+        // 3. Ignore "break" codes (key release)
+        // In scan code set 1, the high bit (0x80) is set for key release.
         if scancode & 0x80 != 0 {
             return None;
         }
+
+        // 4. Decode the make code into a KeyEvent
         return decode_scancode(scancode);
     }
+
+    // No data available
     None
 }
 
-/// Block until a supported key press is available.
+/// Blocking read of a single key press.
 ///
-/// Release scan codes are ignored.
-/// Unsupported keys are skipped.
+/// This function waits in a busy loop until a supported key is pressed.
+/// It is retained for backwards compatibility and simple debugging scenarios.
 ///
-/// # Behavior
+/// # Note
 ///
-/// 1. Wait for controller output buffer to become ready.
-/// 2. Read one scan code from data port `0x60`.
-/// 3. Ignore release events (`scancode & 0x80 != 0`).
-/// 4. Decode supported make codes into a [`KeyEvent`].
-/// 5. Repeat until successful decode.
+/// This function should not be used in the main microkernel loop as it blocks
+/// the dispatcher. Use `poll_keyboard()` instead.
 pub(crate) fn read_key_blocking() -> KeyEvent {
     loop {
-        let scancode = read_scancode_blocking();
-
-        if scancode & 0x80 != 0 {
-            continue;
-        }
-
-        if let Some(event) = decode_scancode(scancode) {
+        // Attempt to get a key non-blocking
+        if let Some(event) = poll_keyboard() {
             return event;
         }
+
+        // If no key was pressed, give the CPU a hint to wait (saves power/storms)
+        spin_loop();
     }
 }
 
+/// Internal: Reads a scan code in a blocking manner.
+///
+/// Waits until the controller output buffer is full, then reads the data.
 fn read_scancode_blocking() -> u8 {
-    // Busy-wait polling loop. `spin_loop` gives the CPU a hint that we are
-    // intentionally waiting on hardware state and can reduce contention.
     loop {
         let status = inb(KBD_STATUS_PORT);
         if status & STATUS_OUTPUT_FULL != 0 {
@@ -97,10 +130,19 @@ fn read_scancode_blocking() -> u8 {
     }
 }
 
+/// Decodes a PS/2 scan code (Set 1) into a high-level `KeyEvent`.
+///
+/// # Arguments
+///
+/// * `scancode` - The raw 8-bit scan code received from the keyboard controller.
+///
+/// # Returns
+///
+/// `Some(KeyEvent)` if the scancode corresponds to a supported key, or `None` otherwise.
 fn decode_scancode(scancode: u8) -> Option<KeyEvent> {
-    // Minimal scan code set 1 table (US layout subset).
-    // Shift/CapsLock/AltGr modifiers are intentionally not handled yet.
+    // Mapping table for US QWERTY layout (subset)
     let event = match scancode {
+        // Numbers
         0x02 => KeyEvent::Char(b'1'),
         0x03 => KeyEvent::Char(b'2'),
         0x04 => KeyEvent::Char(b'3'),
@@ -111,8 +153,12 @@ fn decode_scancode(scancode: u8) -> Option<KeyEvent> {
         0x09 => KeyEvent::Char(b'8'),
         0x0A => KeyEvent::Char(b'9'),
         0x0B => KeyEvent::Char(b'0'),
+
+        // Punctuation (Top row)
         0x0C => KeyEvent::Char(b'-'),
         0x0D => KeyEvent::Char(b'='),
+
+        // Row 1 (QWERTY...)
         0x10 => KeyEvent::Char(b'q'),
         0x11 => KeyEvent::Char(b'w'),
         0x12 => KeyEvent::Char(b'e'),
@@ -125,7 +171,11 @@ fn decode_scancode(scancode: u8) -> Option<KeyEvent> {
         0x19 => KeyEvent::Char(b'p'),
         0x1A => KeyEvent::Char(b'['),
         0x1B => KeyEvent::Char(b']'),
+
+        // Enter
         0x1C => KeyEvent::Enter,
+
+        // Row 2 (ASDF...)
         0x1E => KeyEvent::Char(b'a'),
         0x1F => KeyEvent::Char(b's'),
         0x20 => KeyEvent::Char(b'd'),
@@ -138,7 +188,11 @@ fn decode_scancode(scancode: u8) -> Option<KeyEvent> {
         0x27 => KeyEvent::Char(b';'),
         0x28 => KeyEvent::Char(b'\''),
         0x29 => KeyEvent::Char(b'`'),
+
+        // Backslash
         0x2B => KeyEvent::Char(b'\\'),
+
+        // Row 3 (ZXCV...)
         0x2C => KeyEvent::Char(b'z'),
         0x2D => KeyEvent::Char(b'x'),
         0x2E => KeyEvent::Char(b'c'),
@@ -149,30 +203,43 @@ fn decode_scancode(scancode: u8) -> Option<KeyEvent> {
         0x33 => KeyEvent::Char(b','),
         0x34 => KeyEvent::Char(b'.'),
         0x35 => KeyEvent::Char(b'/'),
+
+        // Space
         0x39 => KeyEvent::Char(b' '),
+
+        // Backspace
         0x0E => KeyEvent::Backspace,
+
+        // Unknown/Unsupported
         _ => return None,
     };
 
     Some(event)
 }
 
+/// Reads a byte from the specified x86 I/O port.
+///
+/// This is a low-level wrapper around the `IN` instruction.
+///
+/// # Arguments
+///
+/// * `port` - The 16-bit I/O port address to read from.
+///
+/// # Returns
+///
+/// The 8-bit value read from the port.
+///
+/// # Safety
+///
+/// This function executes privileged I/O instructions. It should only be called
+/// from contexts where it is safe to do so (like kernel code).
 fn inb(port: u16) -> u8 {
-    // x86 port-mapped I/O read.
-    // Instruction semantics: AL <- IN(DX)
-    // - DX selects the I/O port.
-    // - AL receives the byte read from hardware.
-    //
-    // `options` rationale:
-    // - `nomem`: no direct memory accesses in this asm block.
-    // - `nostack`: does not modify the stack pointer.
-    // - `preserves_flags`: EFLAGS/RFLAGS are preserved.
     let value: u8;
     unsafe {
         asm!(
-            "in al, dx",
-            in("dx") port,
-            out("al") value,
+            "in al, dx",   // Input: AL = IN(DX)
+            in("dx") port, // Port number in DX
+            out("al") value, // Result in AL
             options(nomem, nostack, preserves_flags)
         );
     }
