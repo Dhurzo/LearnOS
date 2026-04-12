@@ -102,3 +102,4 @@ Echo: <line>
 - VGA output requires the QEMU graphical window (`run.sh` defaults to GUI mode).
 - In `-nographic`, VGA memory writes are not visible on terminal.
 - Keyboard input is polling-based (no IRQ/IDT yet), intentionally simple for early kernel bring-up.
+- There is a brach called microkernel with a minimal microkernel approach with the same educational purposes
