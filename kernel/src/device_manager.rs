@@ -52,6 +52,7 @@ impl DeviceManager {
     /// Constructs a new DeviceManager.
     ///
     /// Initializes the cursor to position 0.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             current_cursor: AtomicUsize::new(0),
@@ -62,10 +63,8 @@ impl DeviceManager {
     ///
     /// This is the core mechanism by which the DeviceManager communicates with services.
     fn send_ipc(&self, msg: Message) -> bool {
-        // SAFETY: This accesses a mutable static. In this single-threaded kernel context,
-        // it is safe provided we don't create aliasing mutable references elsewhere simultaneously.
         unsafe {
-            let queue = &mut IPC_QUEUE;
+            let queue = &mut *(&raw mut IPC_QUEUE as *mut crate::ipc::MessageQueue);
             queue.send(msg)
         }
     }
@@ -90,6 +89,9 @@ impl DeviceManager {
     /// Iterates over the string bytes and sends them individually to the service.
     /// Note: This is inefficient for high performance but clear for demonstration.
     pub fn print_string(&self, s: &str) {
+        // Also print to serial for debugging
+        crate::vga::serial_print(s);
+
         for byte in s.as_bytes() {
             let _ = self.write_char(*byte);
         }

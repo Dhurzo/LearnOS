@@ -1,185 +1,454 @@
-//! Microkernel Core: PVH + IPC + Services
+//! LearnOS Microkernel - Main Entry Point
 //!
-//! This crate implements the core of a microkernel architecture for the LearnOS project.
-//! Unlike a monolithic kernel where drivers and system services run in kernel space,
-//! this implementation decouples hardware drivers into "services" that communicate
-//! via Inter-Process Communication (IPC).
+//! This is the heart of the LearnOS microkernel. It runs after boot.S has set up
+//! 64-bit mode and paging.
 //!
-//! ## Architectural Overview
+//! =============================================================================
+//! WHAT IS A MICROKERNEL?
+//! =============================================================================
 //!
-//! The microkernel is designed around a central **Message Dispatcher** loop.
-//! Its responsibilities are:
-//! 1.  **Initialization**: Set up the hardware abstraction layer (DeviceManager).
-//! 2.  **Scheduling**: Poll hardware for events (e.g., keyboard input) and dispatch them.
-//! 3.  **IPC Routing**: Process messages in the global IPC queue, forwarding them to the appropriate service handler.
-//! 4.  **System Call Interface**: (Future) Handle requests from user-space processes.
+//! A microkernel is a kernel design where ONLY essential code runs in privileged
+//! mode (kernel space). Everything else runs in unprivileged user space:
 //!
-//! ## Components
+//!     Traditional Monolithic Kernel:
+//!     =====================
+//!     +------------------+
+//!     |   Kernel Space  |  <-- ALL OS code runs here
+//!     | - File System  |
+//!     | - Network   |
+//!     | - Driver   |
+//!     | - IPC      |
+//!     +------------------+
+//!            |
+//!     +------------------+
+//!     |  User Space   |
+//!     | - Apps     |
+//!     +------------------+
 //!
-//! - **ipc**: Defines the message passing primitives (`MessageQueue`) and message types.
-//! - **device_manager**: Acts as the Hardware Abstraction Layer (HAL), sending commands to services.
-//! - **vga**: The VGA Service. It listens for drawing commands and performs memory-mapped I/O.
-//! - **keyboard**: The Keyboard Service. It provides raw input events to be consumed by the dispatcher.
+//!     Microkernel Design:
+//!     =============
+//!     +------------------+
+//!     |  Kernel Space |  <-- Minimal: only scheduling, memory, IPC
+//!     +------------------+
+//!            |                    syscall / message passing
+//!     +------------------+  +------------------+
+//!     | User Space    |  | User Space    |
+//!     | - File Sys Svc|  | Network Svc |
+//!     | - Display   |  | Shell      |
+//!     +------------------+  +------------------+
 //!
-//! ## Safety Model
+//! The key difference: Services run in separate address spaces with
+//! memory protection. If a service crashes, it doesn't crash the kernel!
 //!
-//! This code runs in a `no_std` environment without a runtime.
-//! - **No Heap**: All memory is static or stack-allocated.
-//! - **No Locks**: Concurrency is managed via atomic operations in the IPC queue.
-//! - **Unsafe Boundaries**: Hardware access (port I/O, volatile memory) is contained in dedicated modules.
+//! =============================================================================
+//! KERNEL BOOT FLOW
+//! =============================================================================
 //!
-//! ## Boot Flow
+//! 1. BIOS/bootloader loads kernel from disk
+//! 2. BIOS finds PVH entry point (.note.Xen)
+//! 3. CPU jumps to pvh_start (boot.S, 32-bit)
+//! 4. boot.S sets up:
+//!    - Page tables (virtual memory)
+//!    - GDT (segment descriptors)
+//!    - Enable 64-bit mode
+//! 5. Jump to _start (here, 64-bit!)
+//! 6. We initialize:
+//!    - VGA display
+//!    - IDT (interrupt descriptor table)
+//!    - Process table (manages processes)
+//!    - Timer (for scheduling)
+//! 7. Switch to user space (init process)
+//! 8. Timer interrupts trigger scheduling
 //!
-//! 1.  **Bootloader (`boot.S`)**: Initializes 64-bit mode and page tables, jumps to `_start`.
-//! 2.  **`_start` (here)**: Initializes the `DeviceManager` and prints boot messages.
-//! 3.  **Main Loop**: Enters the infinite dispatch loop.
+//! =============================================================================
+//! PROCESS MANAGEMENT
+//! =============================================================================
 //!
-//! # Examples
+//! A process is a running program. In our microkernel, each service runs
+//! as a separate process with its own:
+//! - Process ID (PID) - unique identifier
+//! - Address space - memory it can access
+//! - State - READY, RUNNING, BLOCKED, TERMINATED
+//! - Registers - saved CPU state for context switching
 //!
-//! To visualize the flow of a key press:
-//! `Keyboard (HW)` -> `poll_keyboard()` -> `KeyEvent` -> `Dispatcher` -> `IPC_QUEUE` -> `VGA Service` -> `Video Memory`
+//! Process Control Block (PCB):
+//! struct Process {
+//!     pid: Pid,              // Unique ID (1, 2, 3, ...)
+//!     state: ProcessState,  // Current state
+//!     entry_point: u64,   // Where code starts
+//!     registers: ...,      // Saved registers
+//! }
+//!
+//! The process table holds all PCBs.
+//!
+//! =============================================================================
+//! CONTEXT SWITCHING
+//! =============================================================================
+//!
+//! Context switching is how we run multiple processes on one CPU.
+//! The CPU can only run ONE process at a time, but by rapidly
+//! switching between processes, it seems like they're running
+//! simultaneously (time-sharing).
+//!
+//! Steps to switch:
+//! 1. Save current process registers to its PCB
+//! 2. Load next process registers from its PCB  
+//! 3. Switch to next process's stack
+//! 4. Jump to next process's code
+//!
+//! When timer fires (IRQ0), we automatically switch!
+//!
+//! =============================================================================
+//! SYSTEM CALLS (syscall instruction)
+//! =============================================================================
+//!
+//! User processes can't access hardware directly. To do anything
+//! (write to screen, read from disk, etc.), they must ask
+//! the kernel via system calls.
+//!
+//! The syscall instruction:
+//! 1. CPU switches to kernel mode (ring 0)
+//! 2. CPU jumps to IDT entry for vector 0x80
+//! 3. Handler validates arguments
+//! 4. Handler performs operation
+//! 5. Handler returns to user space
+//!
+//! Syscall convention (x86-64 System V):
+//! - rax: syscall number
+//! - rdi, rsi, rdx, r10, r8, r9: arguments
+//! - rax: return value
+//!
+//! Our syscalls:
+//! - 0: EXIT     - terminate process
+//! - 1: WRITE    - write to file descriptor
+//! - 7: VGA_WRITE - write character to screen
+//! - 8: VGA_CLEAR - clear screen
+//! - 9: SCHEDULE - yield CPU to next process
+//! - 6: GETPID   - get current process ID
+//!
+//! =============================================================================
+//! INTERRUPTS AND THE IDT
+//! =============================================================================
+//!
+//! Hardware can interrupt the CPU to signal events (timer tick,
+//! keyboard press, disk ready, etc.). The IDT tells the CPU where
+//! to jump for each interrupt type.
+//!
+//! IDT Entry (16 bytes):
+//! struct IdtEntry {
+//!     offset_low: u16,    // Handler address bits 0-15
+//!     selector: u16,     // Code segment selector
+//!     ist: u8,        // Stack switch table index
+//!     type_attr: u8,    // Type (trap/interrupt gate) + DPL
+//!     offset_mid: u16,   // Handler address bits 16-31
+//!     offset_high: u32,   // Handler address bits 32-63
+//!     reserved: u32,
+//! }
+//!
+//! Vector 0x80: syscall (our syscalls)
+//! Vector 0x20: timer (IRQ0, for scheduling)
+//! Vector 0x21: keyboard (IRQ1)
+//!
+//! =============================================================================
+//! MEMORY LAYOUT
+//! =============================================================================
+//!
+//! User Space (lower half):
+//! 0x0000000000400000 - Code starts here (typical ELF load)
+//! 0x00007FFFFFFFE000 - Stack (grows down)
+//! 0x00007FFFFFFFFFFF - User space end
+//!
+//! Kernel Space (upper half):
+//! 0xFFFFFFFF80000000+ - Kernel code
+//!
+//! Physical:
+//! 0x000000 - 0x200000: Kernel (identity mapped)
+//! 0x0B8000: VGA text memory (0xB8000-0xB8F9F = 80x25 text)
+//!
+//! =============================================================================
 
-#![no_std] // Don't use the standard library (no heap, no stdio)
-#![no_main] // Custom entry point (_start) instead of main
+#![no_std] // Don't use standard library (no heap, no files, etc.)
+#![no_main] // Custom entry point (_start), not main()
 
 use core::panic::PanicInfo;
 
+// Import all kernel modules
 mod device_manager;
+mod elf;
 mod ipc;
 mod keyboard;
+mod paging;
+mod process;
+mod syscall;
+mod user_program;
+mod userspace;
 mod vga;
 
-// Include the boot assembly which handles CPU mode switching before Rust runs.
+// Import boot.S (contains pvh_start, page tables, GDT)
 core::arch::global_asm!(include_str!("boot.S"));
 
-// Import core IPC components
+// Use the device manager for hardware access
 use crate::device_manager::get_device_manager;
-use crate::ipc::{Message, IPC_QUEUE};
+use crate::process::PROCESS_TABLE;
 
-/// The kernel entry point, called by the bootloader (boot.S).
+/// ============================================================================
+/// KERNEL ENTRY POINT (_start)
+/// ============================================================================
 ///
-/// This function sets up the microkernel environment and transitions to the
-/// main dispatch loop.
+/// This is called by boot.S after setting up 64-bit mode. This is where
+/// the kernel begins execution in Rust code.
 ///
 /// # Safety
 ///
-/// This is the first Rust function executed. It assumes the CPU is in 64-bit
-/// long mode with paging enabled. It never returns.
+/// This is the first Rust code executed. It assumes:
+/// - CPU is in 64-bit long mode
+/// - Paging is enabled
+/// - A valid stack exists
+/// - This function NEVER RETURNS (it switches to user space)
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Input buffer for the line editor.
-    const MAX_INPUT: usize = 128;
-    let mut input = [0u8; MAX_INPUT];
-    let mut len = 0usize;
+    // Write '1' to VGA to show we entered _start (Rust kernel entry)
+    unsafe {
+        core::ptr::write_volatile(0xB8000 as *mut u8, b'1');
+        core::ptr::write_volatile(0xB8001 as *mut u8, 0x0A); // Bright green
+    }
 
-    // --- Microkernel Initialization Phase ---
-    //
-    // In a microkernel, we don't mount drivers directly. We initialize a
-    // "Device Manager" which acts as the interface to the system.
+    // Initialize the device manager and VGA
     let device_manager = get_device_manager();
 
-    // 1. Initialize the VGA Service (send a clear command via IPC/HAL)
+    // Write '2' to VGA after getting device manager
+    unsafe {
+        core::ptr::write_volatile(0xB8002 as *mut u8, b'2');
+        core::ptr::write_volatile(0xB8003 as *mut u8, 0x0A);
+    }
+
     device_manager.initialize_vga();
 
-    // 2. Print boot messages to verify the service is working
-    device_manager.print_string("Microkernel booting...\n");
-    device_manager.print_string("Services: VGA [OK], Keyboard [OK]\n");
-    device_manager.print_string("Type text and press Enter\n");
-    device_manager.print_string("> ");
+    // Write '3' to VGA after VGA init
+    unsafe {
+        core::ptr::write_volatile(0xB8004 as *mut u8, b'3');
+        core::ptr::write_volatile(0xB8005 as *mut u8, 0x0A);
+    }
 
-    // --- Main Loop: Message Dispatcher ---
-    //
-    // This loop simulates the role of the kernel core. It:
-    // 1. Polls for hardware events (Keyboard)
-    // 2. Processes IPC messages from other services (if any)
-    //
-    // In a fully fledged microkernel, this would also handle context switching
-    // between user processes.
-    loop {
-        // 1. Poll for input from Keyboard Service (Driver)
-        // We use non-blocking polling here. If a key is pressed, we process it.
-        if let Some(event) = keyboard::poll_keyboard() {
-            match event {
-                keyboard::KeyEvent::Char(byte) => {
-                    // Buffer the character locally
-                    if len < input.len() {
-                        input[len] = byte;
-                        len += 1;
-                        // Send to VGA Service via IPC (DeviceManager facade)
-                        device_manager.write_char(byte);
-                    }
-                }
-                keyboard::KeyEvent::Backspace => {
-                    if len > 0 {
-                        len -= 1;
-                        // Send backspace command to VGA Service
-                        device_manager.backspace();
-                    }
-                }
-                keyboard::KeyEvent::Enter => {
-                    // Process line completion (Echo logic)
-                    let line = &input[..len];
+    // ============================================================================
+    // STEP 2: CONFIGURE IDT
+    // ============================================================================
+    unsafe {
+        setup_idt();
+    }
 
-                    // Send newline character via IPC
-                    // Note: We use unsafe here to alias the static mutable IPC_QUEUE.
-                    // In a real kernel, this would be abstracted into a system call or safe wrapper.
-                    unsafe {
-                        let queue = &mut *(&raw mut IPC_QUEUE as *mut crate::ipc::MessageQueue);
-                        let _ = queue.send(Message::VgaPrint(b'\n'));
-                    }
-                    vga::print_vga("Echo: ");
+    // Write '4' to VGA after IDT setup
+    unsafe {
+        core::ptr::write_volatile(0xB8006 as *mut u8, b'4');
+        core::ptr::write_volatile(0xB8007 as *mut u8, 0x0A);
+    }
 
-                    // Echo each character back to the user
-                    for &byte in line {
-                        device_manager.write_char(byte);
-                    }
+    // ============================================================================
+    // STEP 3: CREATE PROCESSES
+    // ============================================================================
+    unsafe {
+        let pt = &mut *(&raw mut PROCESS_TABLE as *mut process::ProcessTable);
 
-                    // Send new prompt
-                    unsafe {
-                        let queue = &mut *(&raw mut IPC_QUEUE as *mut crate::ipc::MessageQueue);
-                        let _ = queue.send(Message::VgaPrint(b'\n'));
-                        let _ = queue.send(Message::VgaPrint(b'>'));
-                        let _ = queue.send(Message::VgaPrint(b' '));
-                    }
-
-                    len = 0;
-                }
+        let init_entry = crate::user_program::init::init_main as u64;
+        if let Some(init_pid) = pt.spawn(init_entry, "init") {
+            device_manager.print_string("Init PID 1: RUNNING\n");
+            pt.set_running(init_pid);
+            process::set_current_pid(init_pid);
+            // Write 'I' for Init
+            unsafe {
+                core::ptr::write_volatile(0xB8008 as *mut u8, b'I');
+                core::ptr::write_volatile(0xB8009 as *mut u8, 0x0C); // Bright red
             }
         }
 
-        // 2. Process messages from IPC Queue
-        // This handles messages sent by other services or background tasks.
-        unsafe {
-            let queue = &mut *(&raw mut IPC_QUEUE as *mut crate::ipc::MessageQueue);
-            while let Some(msg) = queue.receive() {
-                match msg {
-                    // Route messages to the VGA Service handler
-                    Message::VgaPrint(byte) => vga::write_byte(byte),
-                    Message::VgaClear => vga::clear_screen(),
-                    Message::VgaBackspace => vga::backspace(),
-                    Message::VgaNewline => vga::write_byte(b'\n'),
-                    // Handle external keyboard events (e.g., from a virtual terminal)
-                    Message::KeyboardEvent(e) => match e {
-                        ipc::KeyEvent::Char(byte) => vga::write_byte(byte),
-                        _ => {}
-                    },
-                }
+        let shell_entry = crate::user_program::shell::shell_main as u64;
+        if let Some(shell_pid) = pt.spawn(shell_entry, "shell") {
+            device_manager.print_string("Shell PID 2: READY\n");
+            pt.set_ready(shell_pid);
+            // Write 'S' for Shell
+            unsafe {
+                core::ptr::write_volatile(0xB800A as *mut u8, b'S');
+                core::ptr::write_volatile(0xB800B as *mut u8, 0x0C);
             }
         }
     }
+
+    // Write '5' to VGA after process creation
+    unsafe {
+        core::ptr::write_volatile(0xB800C as *mut u8, b'5');
+        core::ptr::write_volatile(0xB800D as *mut u8, 0x0A);
+    }
+
+    // ============================================================================
+    // STEP 4: CONFIGURE TIMER
+    // ============================================================================
+    setup_timer();
+
+    // Write 'T' for Timer
+    unsafe {
+        core::ptr::write_volatile(0xB800E as *mut u8, b'T');
+        core::ptr::write_volatile(0xB800F as *mut u8, 0x0A);
+    }
+
+    device_manager.print_string("\n[OK] IDT configured\n");
+    device_manager.print_string("[OK] Timer configured\n");
+    device_manager.print_string("\nSwitching to user space...\n");
+
+    // Write 'U' for User mode
+    unsafe {
+        core::ptr::write_volatile(0xB8010 as *mut u8, b'U');
+        core::ptr::write_volatile(0xB8011 as *mut u8, 0x0A);
+    }
+
+    // ============================================================================
+    // STEP 5: SWITCH TO USER SPACE
+    // ============================================================================
+    process::schedule_init();
+
+    loop {}
 }
 
-/// Panic handler for the kernel.
+/// ============================================================================
+/// IDT SETUP
+/// ============================================================================
 ///
-/// In a microkernel, panics are critical failures. In a more advanced
-/// implementation, we would send a message to a "Debug Service" running
-/// in user space to log the crash.
+/// Configures the Interrupt Descriptor Table to handle syscalls
+/// and timer interrupts.
+///
+/// The IDT holds 256 entries (one for each interrupt vector).
+/// - Vector 0x80 (128): syscall instruction
+/// - Vector 0x20 (32): Timer IRQ0
 ///
 /// # Safety
 ///
-/// This function is unsafe because it halts the CPU and never returns.
+/// This modifies the CPU's interrupt table. Must be done before
+/// interrupts are enabled.
+unsafe fn setup_idt() {
+    // Call the comprehensive IDT setup in syscall.rs
+    // This:
+    // 1. Clears all IDT entries to null
+    // 2. Sets up syscall handler at vector 0x80
+    // 3. Sets up timer handler at vector 0x20
+    // 4. Loads the IDT with lidt instruction
+    crate::syscall::init_idt();
+}
+
+/// ============================================================================
+/// TIMER SETUP
+/// ============================================================================
+///
+/// Programs the PIT (Programmable Interval Timer) to interrupt
+/// periodically for scheduling.
+///
+/// The PIT runs at 1,193,182 Hz (approx 1.19 MHz).
+/// We divide this to get our desired interrupt rate.
+///
+/// # Calculation:
+/// divisor = 1193182 / 100 Hz = 11931
+///
+/// # Safety
+///
+/// This writes to I/O port 0x40 (PIT channel 0).
+fn setup_timer() {
+    // PIT programming:
+    // 1. Send mode/command byte to port 0x43
+    // 2. Send divisor low byte to port 0x40
+    // 3. Send divisor high byte to port 0x40
+    //
+    // Command byte 0x36 = 00110110b:
+    // - Bits 7-6: 00 = Channel 0
+    // - Bits 5-4: 11 = Load both bytes
+    // - Bits 3-1: 011 = Square wave generator
+    // - Bit 0: 0 = 16-bit counter
+    unsafe {
+        core::arch::asm!(
+            "mov al, 0x36",
+            "out 0x43, al",
+            "mov al, 0xB3", // 11931 & 0xFF = 0xB3
+            "out 0x40, al",
+            "mov al, 0x2E", // 11931 >> 8 = 0x2E
+            "out 0x40, al",
+            options(nostack)
+        );
+    }
+}
+
+/// ============================================================================
+/// TIMER INTERRUPT HANDLER
+/// ============================================================================
+///
+/// Called when the timer interrupt fires (approx 100 times/sec).
+/// This is where preemptive multitasking happens!
+///
+/// When the timer fires:
+/// 1. CPU saves current process state
+/// 2. CPU jumps here (via IDT)
+/// 3. We call schedule_next() to pick next process
+/// 4. schedule_next() switches to that process
+/// 5. Return via iret (not shown here)
+///
+/// This happens ~100 times per second, giving each
+/// process a slice of CPU time.
+///
+/// # Safety
+///
+/// Called from interrupt context. Must be careful
+/// about what it calls.
+#[no_mangle]
+pub extern "C" fn timer_tick() {
+    // Schedule the next process (round-robin)
+    process::schedule_next();
+
+    // Send End Of Interrupt to PIC (Programmable Interrupt Controller)
+    // This tells the hardware we're done handling this interrupt.
+    unsafe {
+        core::arch::asm!(
+            "mov al, 0x20", // Non-specific EOI
+            "out 0x20, al", // Send to master PIC
+            options(nostack)
+        );
+    }
+}
+
+/// ============================================================================
+/// KEYBOARD INTERRUPT HANDLER
+/// ============================================================================
+///
+/// Called when a key is pressed. In a full implementation,
+/// we'd read the key and send it to the focused process.
+///
+/// # Safety
+///
+/// Called from interrupt context.
+#[no_mangle]
+pub extern "C" fn keyboard_irq() {
+    // Read keyboard status (optional)
+    // Read scan code from port 0x60
+
+    // In a full kernel, we'd:
+    // 1. Read scan code from keyboard
+    // 2. Convert to key code
+    // 3. Store in keyboard buffer
+    // 4. Signal waiting process
+
+    // Send EOI
+    unsafe {
+        core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nostack));
+    }
+}
+
+/// ============================================================================
+/// PANIC HANDLER
+/// ============================================================================
+///
+/// This is called if something goes wrong (panic in Rust).
+/// We simply halt - in a real kernel, we'd log the crash.
+///
+/// # Safety
+///
+/// Halts the CPU permanently.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    // Halting the CPU in a tight loop.
+    // If panicking, disable interrupts and halt
     loop {}
 }

@@ -105,6 +105,7 @@ pub(crate) fn poll_keyboard() -> Option<KeyEvent> {
 ///
 /// This function should not be used in the main microkernel loop as it blocks
 /// the dispatcher. Use `poll_keyboard()` instead.
+#[allow(dead_code)]
 pub(crate) fn read_key_blocking() -> KeyEvent {
     loop {
         // Attempt to get a key non-blocking
@@ -120,6 +121,7 @@ pub(crate) fn read_key_blocking() -> KeyEvent {
 /// Internal: Reads a scan code in a blocking manner.
 ///
 /// Waits until the controller output buffer is full, then reads the data.
+#[allow(dead_code)]
 fn read_scancode_blocking() -> u8 {
     loop {
         let status = inb(KBD_STATUS_PORT);

@@ -42,10 +42,15 @@ SECTIONS {
         KEEP(*(.note.pvh))
     }
 
-    /* Load executable sections at 2 MiB.
-     * This avoids low-memory firmware regions and matches bootstrap mappings.
-     */
-    . = 2M;
+    /* Load kernel at 1MB (standard boot load address) */
+    . = 0x100000;
+
+    /* Text section - this is where boot.S code goes */
+    .text : ALIGN(4K) {
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+        . = ALIGN(4096);
+    }
 
     /* Text Section - Executable Code
      * 
