@@ -180,6 +180,7 @@ mod keyboard;
 mod paging;
 mod process;
 mod syscall;
+mod tss;
 mod user_program;
 mod userspace;
 mod vga;
@@ -231,7 +232,28 @@ pub extern "C" fn _start() -> ! {
     }
 
     // ============================================================================
-    // STEP 2: CONFIGURE IDT
+    // STEP 2: CONFIGURE TASK STATE SEGMENT
+    // ============================================================================
+    //
+    // The TSS provides the kernel stack pointer (RSP0) that the CPU loads
+    // when an interrupt or syscall transitions from ring 3 to ring 0.
+    // Without it, ring-3->ring-0 transitions would corrupt the kernel!
+    unsafe {
+        crate::tss::init();
+    }
+
+    // ============================================================================
+    // STEP 3: CONFIGURE SYSCALL MSRS
+    // ============================================================================
+    //
+    // Sets up STAR, LSTAR, and SFMASK MSRs so the `syscall` instruction
+    // in user programs jumps to our `syscall_entry` handler.
+    unsafe {
+        crate::syscall::init_syscall();
+    }
+
+    // ============================================================================
+    // STEP 4: CONFIGURE IDT
     // ============================================================================
     unsafe {
         setup_idt();
@@ -280,7 +302,18 @@ pub extern "C" fn _start() -> ! {
     }
 
     // ============================================================================
-    // STEP 4: CONFIGURE TIMER
+    // STEP 4a: REMAP PIC (IRQ0→0x20, IRQ1→0x21, …)
+    // ============================================================================
+    //
+    // By default the PIC maps IRQ0 to vector 0x08 (Double Fault!). We must remap
+    // both master and slave PICs so that hardware interrupts don't collide with
+    // CPU exceptions.
+    unsafe {
+        remap_pic();
+    }
+
+    // ============================================================================
+    // STEP 4b: CONFIGURE TIMER
     // ============================================================================
     setup_timer();
 
@@ -331,6 +364,79 @@ unsafe fn setup_idt() {
     // 3. Sets up timer handler at vector 0x20
     // 4. Loads the IDT with lidt instruction
     crate::syscall::init_idt();
+}
+
+/// ============================================================================
+/// PIC REMAP
+/// ============================================================================
+///
+/// Remaps the 8259A PIC (Programmable Interrupt Controller) so hardware IRQs
+/// don't overlap with CPU exception vectors (0-31).
+///
+/// Default: IRQ0→0x08 (DOUBLE FAULT!), IRQ1→0x09, ...
+/// After:   IRQ0→0x20, IRQ1→0x21, ... (safe zone)
+///
+/// # Safety
+///
+/// Writes to I/O ports 0x20/0x21 (master PIC) and 0xA0/0xA1 (slave PIC).
+unsafe fn remap_pic() {
+    // Save current masks (they may be set by BIOS)
+    let mask_master: u8;
+    let mask_slave: u8;
+    core::arch::asm!(
+        "in al, 0x21",
+        "mov {m}, al",
+        "in al, 0xA1",
+        "mov {s}, al",
+        m = out(reg_byte) mask_master,
+        s = out(reg_byte) mask_slave,
+        options(nostack),
+    );
+
+    // Start init sequence (ICW1) — both PICs
+    core::arch::asm!(
+        "mov al, 0x11",     // ICW4 needed, cascade mode
+        "out 0x20, al",     // master PIC command port
+        "out 0xA0, al",     // slave PIC command port
+        options(nostack),
+    );
+
+    // ICW2 — vector bases
+    core::arch::asm!(
+        "mov al, 0x20",     // master base: IRQ0→INT 0x20
+        "out 0x21, al",
+        "mov al, 0x28",     // slave base:  IRQ8→INT 0x28
+        "out 0xA1, al",
+        options(nostack),
+    );
+
+    // ICW3 — cascade wiring
+    core::arch::asm!(
+        "mov al, 0x04",     // master: slave on IRQ2 (bit 2)
+        "out 0x21, al",
+        "mov al, 0x02",     // slave:  cascade identity
+        "out 0xA1, al",
+        options(nostack),
+    );
+
+    // ICW4 — environment
+    core::arch::asm!(
+        "mov al, 0x01",     // 8086 mode
+        "out 0x21, al",
+        "out 0xA1, al",
+        options(nostack),
+    );
+
+    // Restore masks — keep everything masked for now, unmask timer later
+    core::arch::asm!(
+        "mov al, {m}",
+        "out 0x21, al",
+        "mov al, {s}",
+        "out 0xA1, al",
+        m = in(reg_byte) mask_master,
+        s = in(reg_byte) mask_slave,
+        options(nostack),
+    );
 }
 
 /// ============================================================================

@@ -488,35 +488,52 @@ pub fn schedule_init() {
 }
 
 /// ============================================================================
-/// Switch to User Space
+/// Switch to User Space (Ring 3)
 /// ============================================================================
 ///
-/// This performs the magic jump from kernel mode
-/// to user mode. After this, we're executing
-/// user-space code!
+/// This performs the transition from kernel mode (ring 0) to user mode
+/// (ring 3) using the `iretq` instruction.
+///
+/// How IRETQ works for ring transitions:
+///   1. CPU pops RIP, CS, RFLAGS, RSP, SS from the stack
+///   2. If CS.RPL != current CPL, CPU also loads SS.RPL = CS.RPL
+///   3. Since new RPL=3 > current RPL=0, it's an outer-privilege jump
+///   4. CPU validates segment descriptors (DPL must match RPL)
+///   5. CPU sets CPL=3 and continues executing at RIP in ring 3
+///
+/// After `iretq`, the CPU is running at ring 3:
+///   - Memory accesses check the U (user) bit in page tables
+///   - Privileged instructions (wrmsr, lidt, lgdt, etc.) cause #GP
+///   - `syscall` and `int` can request kernel services
 ///
 /// # Arguments
 ///
-/// * `entry` - User process entry point
-/// * `stack` - User stack address
+/// * `entry` - User process entry point (RIP)
+/// * `stack` - User stack pointer (RSP)
 ///
 /// # Safety
 ///
-/// This modifies CPU state and never returns.
+/// Modifies CPU privilege level. Never returns.
 fn schedule_user(entry: u64, stack: u64) {
     unsafe {
-        // Set up user stack and jump to entry point
-        // Note: In a full kernel, we'd also switch CR3
-        // for different address spaces
-        let rsp = stack;
-        let rip = entry;
-
         core::arch::asm!(
-            "mov rsp, {0}",
-            "mov rbp, {0}",
-            "jmp {1}",
-            in(reg) rsp,
-            in(reg) rip,
+            // Build iretq frame on stack (reverse order):
+            "push 0x23",        // SS = ring-3 data segment | RPL3
+            "push {stack}",     // User RSP
+            "push {rflags}",    // RFLAGS with IF=1 for interrupts
+            "push 0x1B",        // CS = ring-3 code segment | RPL3
+            "push {entry}",     // User RIP
+
+            // Set data segments for user mode
+            "mov ax, 0x23",
+            "mov ds, ax",
+            "mov es, ax",
+
+            // iretq → pops RIP, CS, RFLAGS, RSP, SS and enters ring 3
+            "iretq",
+            stack = in(reg) stack,
+            entry = in(reg) entry,
+            rflags = in(reg) 0x202u64,   // IF=1, reserved bits set
             options(noreturn)
         );
     }
