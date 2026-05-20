@@ -95,8 +95,44 @@
 //!
 //! =============================================================================
 
-use crate::paging::{MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START};
+use crate::paging::{self, MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START};
 use core::sync::atomic::{AtomicU16, Ordering};
+
+// =============================================================================
+// IPC Message and Per-Process Queue
+// =============================================================================
+
+/// Size of a single IPC message in bytes (fixed-size).
+pub const IPC_MSG_SIZE: usize = 64;
+
+/// Number of messages per-process queue.
+pub const IPC_QUEUE_CAPACITY: usize = 16;
+
+/// Ensure each IpcMessage is exactly 64 bytes.
+#[allow(unused)]
+const _IPC_MSG_SIZE_CHECK: [(); 64] = [(); core::mem::size_of::<IpcMessage>()];
+
+/// A single IPC message exchanged between processes via kernel-mediated IPC.
+///
+/// The kernel copies messages between sender and receiver address spaces.
+/// Messages are fixed-size (64 bytes) for simplicity and predictability.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcMessage {
+    /// PID of the sending process (filled in by kernel).
+    pub src_pid: u16,
+    /// Message type (interpreted by the receiver).
+    pub msg_type: u16,
+    /// Payload bytes (60 bytes — total struct is 64).
+    pub data: [u8; IPC_MSG_SIZE - 4],
+}
+
+impl IpcMessage {
+    /// Create a new IPC message with the given source and type.
+    pub const fn new(src_pid: u16, msg_type: u16, data: [u8; IPC_MSG_SIZE - 4]) -> Self {
+        Self { src_pid, msg_type, data }
+    }
+}
 
 /// ============================================================================
 /// Maximum number of processes the kernel can manage
@@ -148,8 +184,21 @@ pub struct Process {
     /// Memory regions (code, data, stack)
     pub memory_regions: [Option<MemoryRegion>; 4],
 
+    /// Physical address of this process's PML4 (loaded into CR3 on context switch)
+    pub cr3: u64,
+
+    /// Top of this process's kernel stack (TSS.RSP0 is set to this on context switch)
+    pub kernel_stack_top: u64,
+
     /// Human-readable name (for debugging)
     pub name: &'static str,
+
+    /// Per-process IPC message queue (fixed-size ring buffer).
+    pub ipc_queue: [Option<IpcMessage>; IPC_QUEUE_CAPACITY],
+    /// Head of the IPC ring buffer (next slot to read).
+    pub ipc_head: usize,
+    /// Tail of the IPC ring buffer (next slot to write).
+    pub ipc_tail: usize,
 }
 
 /// ============================================================================
@@ -208,20 +257,45 @@ impl Process {
             entry_point: entry,
             registers: ProcessRegisters::default(),
             memory_regions: [
-                // Code region: starts at USER_VADDR_START
                 Some(MemoryRegion::new(USER_VADDR_START, 0x100000, 0)),
-                // Data region: after code
                 Some(MemoryRegion::new(USER_VADDR_START + 0x100000, 0x100000, 0)),
-                // Stack: at high address, grows down
                 Some(MemoryRegion::new(
                     USER_STACK_VADDR - USER_STACK_SIZE,
                     USER_STACK_SIZE,
                     0,
                 )),
-                None, // Extra (future use)
+                None,
             ],
+            cr3: 0,
+            kernel_stack_top: 0,
             name,
+            ipc_queue: [None; IPC_QUEUE_CAPACITY],
+            ipc_head: 0,
+            ipc_tail: 0,
         }
+    }
+
+    /// Push a message into this process's IPC queue.
+    /// Returns true on success, false if queue is full.
+    pub fn ipc_push(&mut self, msg: IpcMessage) -> bool {
+        let next_tail = (self.ipc_tail + 1) % IPC_QUEUE_CAPACITY;
+        if next_tail == self.ipc_head {
+            return false;
+        }
+        self.ipc_queue[self.ipc_tail] = Some(msg);
+        self.ipc_tail = next_tail;
+        true
+    }
+
+    /// Pop a message from this process's IPC queue.
+    /// Returns `None` if the queue is empty.
+    pub fn ipc_pop(&mut self) -> Option<IpcMessage> {
+        if self.ipc_head == self.ipc_tail {
+            return None;
+        }
+        let msg = self.ipc_queue[self.ipc_head].take();
+        self.ipc_head = (self.ipc_head + 1) % IPC_QUEUE_CAPACITY;
+        msg
     }
 
     /// ============================================================================
@@ -236,9 +310,9 @@ impl Process {
     }
 }
 
-/// ============================================================================
-/// Default register state
-/// ============================================================================
+    /// ============================================================================
+    /// Default register state
+    /// ============================================================================
 impl Default for ProcessRegisters {
     fn default() -> Self {
         Self {
@@ -314,8 +388,24 @@ impl ProcessTable {
 
         // Find empty slot and create process
         self.processes.iter_mut().find(|p| p.is_none()).map(|slot| {
-            *slot = Some(Process::new(pid, entry, name));
+            // 1. Allocate a physical frame for the user code and copy it
+            let code_frame = paging::alloc_frame();
+            unsafe {
+                core::ptr::copy_nonoverlapping(entry as *const u8, code_frame as *mut u8, 4096);
+            }
+
+            // 2. Create per-process page tables with the code mapped at 0x400000
+            let cr3 = paging::create_address_space(code_frame);
+
+            // 3. Allocate per-process kernel stack (4KB)
+            let kstack_frame = paging::alloc_frame();
+            let kernel_stack_top = kstack_frame + 4096;
+
+            // 4. Create the process with user-space entry point
+            *slot = Some(Process::new(pid, paging::USER_VADDR_START, name));
             let p = slot.as_mut().unwrap();
+            p.cr3 = cr3;
+            p.kernel_stack_top = kernel_stack_top;
             p.init_registers();
             pid
         })

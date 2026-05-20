@@ -232,6 +232,24 @@ pub extern "C" fn _start() -> ! {
     }
 
     // ============================================================================
+    // STEP 1b: INITIALIZE PHYSICAL FRAME ALLOCATOR
+    // ============================================================================
+    // The frame allocator manages physical memory for page tables and
+    // user-process code pages. Must be called before any spawn() or
+    // create_address_space().
+    paging::init_frame_allocator();
+
+    // ============================================================================
+    // STEP 1c: ENABLE PAGE GLOBAL ENABLE (CR4.PGE)
+    // ============================================================================
+    // This makes kernel page-table entries with the Global (G) bit survive
+    // CR3 writes, so kernel TLB entries don't get flushed on every context
+    // switch. Must be done once before any per-process page tables are created.
+    unsafe {
+        paging::enable_pge();
+    }
+
+    // ============================================================================
     // STEP 2: CONFIGURE TASK STATE SEGMENT
     // ============================================================================
     //

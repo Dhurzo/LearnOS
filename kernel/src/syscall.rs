@@ -104,6 +104,8 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::VGA_CLEAR] = Some(sys_vga_clear);
     table.handlers[syscall_nr::SCHEDULE] = Some(sys_schedule);
     table.handlers[syscall_nr::GETPID] = Some(sys_getpid);
+    table.handlers[syscall_nr::IPC_SEND] = Some(sys_ipc_send);
+    table.handlers[syscall_nr::IPC_RECV] = Some(sys_ipc_recv);
     table
 };
 
@@ -142,6 +144,94 @@ fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr:
 
 fn sys_getpid(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     process::get_current_pid() as isize
+}
+
+// =============================================================================
+// IPC SYSCALL HANDLERS
+// =============================================================================
+
+/// Check whether an address is in user-accessible memory range.
+fn is_valid_user_ptr(ptr: usize) -> bool {
+    // User code is mapped at 0x400000. User stack is near 0x7FFF...
+    // Anything below 0x400000 or above 0x8000000000 is not user space.
+    ptr >= 0x400000 && ptr < 0x800000000
+}
+
+/// IPC_SEND: Send a message to another process.
+///
+/// Arguments (syscall convention):
+///   a1 = dst_pid   (target process PID)
+///   a2 = msg_ptr   (user-space pointer to a 64-byte IpcMessage)
+///
+/// The kernel copies the message from the sender's address space into
+/// the destination process's kernel-side IPC queue. The `src_pid` field
+/// is overwritten with the current process's PID.
+fn sys_ipc_send(dst_pid: usize, msg_ptr: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    // Validate destination PID
+    if dst_pid == 0 || dst_pid > 0xFFFF {
+        return -1;
+    }
+    // Validate the user-space pointer
+    if !is_valid_user_ptr(msg_ptr) {
+        return -1;
+    }
+
+    let current = process::get_current_pid();
+
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+
+        if let Some(dst) = (*pt).get_mut(dst_pid as u16) {
+            // Read the 64-byte message from user space
+            let mut msg: process::IpcMessage = core::mem::zeroed();
+            core::ptr::copy_nonoverlapping(
+                msg_ptr as *const u8,
+                &mut msg as *mut process::IpcMessage as *mut u8,
+                core::mem::size_of::<process::IpcMessage>(),
+            );
+            // Set the sender PID (trusted kernel-side)
+            msg.src_pid = current;
+
+            // Push into destination's queue
+            if dst.ipc_push(msg) {
+                return 0;
+            }
+        }
+    }
+    -1
+}
+
+/// IPC_RECV: Receive a message from this process's IPC queue.
+///
+/// Arguments (syscall convention):
+///   a1 = buf_ptr   (user-space pointer to a 64-byte buffer)
+///
+/// The kernel copies the oldest message from the current process's
+/// kernel-side IPC queue into the user-provided buffer.
+/// Returns 64 (bytes copied) on success, or -1 if the queue is empty.
+fn sys_ipc_recv(buf_ptr: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if !is_valid_user_ptr(buf_ptr) {
+        return -1;
+    }
+
+    let current = process::get_current_pid();
+
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+
+        if let Some(p) = (*pt).get_mut(current) {
+            if let Some(msg) = p.ipc_pop() {
+                // Write the message to user space
+                core::ptr::copy_nonoverlapping(
+                    &msg as *const process::IpcMessage as *const u8,
+                    buf_ptr as *mut u8,
+                    core::mem::size_of::<process::IpcMessage>(),
+                );
+                return core::mem::size_of::<process::IpcMessage>() as isize;
+            }
+        }
+    }
+    -1
 }
 
 // =============================================================================
@@ -199,7 +289,7 @@ core::arch::global_asm!(
     "syscall_entry:",
     // Save user RSP in global, load kernel stack
     "    mov [rip + USER_RSP_SAVE], rsp",
-    "    mov rsp, [rip + KERNEL_RSP]",
+    "    mov rsp, [rip + CURRENT_KERNEL_RSP]",
     "",
     // Save callee-saved registers plus RCX/R11 (needed for sysretq)
     "    push r15",
@@ -459,6 +549,17 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
             *frame.add(0)  = p.registers.r15;
             *frame.add(15) = p.registers.rip;
             *frame.add(17) = p.registers.rflags;
+
+            // === 5. Switch to next process's address space ===
+            // Write CR3 with the next process's PML4 physical address.
+            // This TLB-flushes all non-global entries automatically.
+            core::arch::asm!("mov cr3, {}", in(reg) p.cr3, options(nostack));
+
+            // === 6. Update TSS.RSP0 so interrupts use this process's kernel stack ===
+            crate::tss::TSS.set_rsp0(p.kernel_stack_top);
+
+            // === 7. Update syscall kernel stack (syscall doesn't use TSS.RSP0) ===
+            crate::tss::CURRENT_KERNEL_RSP = p.kernel_stack_top;
 
             p.state = ProcessState::Running;
         }

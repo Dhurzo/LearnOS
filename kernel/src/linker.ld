@@ -117,13 +117,12 @@ SECTIONS {
         . = ALIGN(4096);      /* Align to 4KB boundary */
     }
 
-    /* End Marker - Optional but Good Practice
-     * 
-     * Purpose: Provides a clean end boundary for the kernel image
-     * Alignment: 8-byte boundary for memory address alignment
-     * 
-     * This ensures proper alignment for any post-processing tools
-     * and provides a clear end marker for the kernel binary.
+    /* End Marker
+     *
+     * __kernel_end is used by the frame allocator to know where
+     * free physical memory begins. The allocator starts bumping
+     * from this address upward.
      */
-    . = ALIGN(8);
+    . = ALIGN(4096);
+    __kernel_end = .;
 }

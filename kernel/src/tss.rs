@@ -59,6 +59,14 @@ impl TaskStateSegment {
         self.data[4..12].copy_from_slice(&bytes);
     }
 
+    /// Update RSP0 to point to the given process's kernel stack.
+    /// Called during context switch so the CPU uses the correct
+    /// kernel stack when the next process makes a syscall or is interrupted.
+    pub fn set_rsp0(&mut self, rsp0: u64) {
+        let bytes = rsp0.to_le_bytes();
+        self.data[4..12].copy_from_slice(&bytes);
+    }
+
     /// Set the I/O map base address.
     ///
     /// If this value is >= the TSS limit, the CPU will raise #GP
@@ -110,6 +118,14 @@ pub static mut KERNEL_RSP: u64 = 0;
 /// `sysretq`.
 #[no_mangle]
 pub static mut USER_RSP_SAVE: u64 = 0;
+
+/// Per-process kernel stack pointer for `syscall` entry.
+///
+/// Updated during context switch to point to the current process's
+/// kernel stack. The `syscall_entry` assembly loads RSP from this
+/// global so each process uses its own kernel stack.
+#[no_mangle]
+pub static mut CURRENT_KERNEL_RSP: u64 = 0;
 
 /// Get the top address of the kernel stack.
 ///

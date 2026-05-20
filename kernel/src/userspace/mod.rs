@@ -41,13 +41,24 @@ pub mod vfs {
 }
 
 pub mod ipc_client {
-    use crate::syscall::{syscall2, syscall3, syscall_nr};
+    use crate::process::IpcMessage;
+    use crate::syscall::{syscall2, syscall_nr};
 
-    pub fn send_msg(to_pid: usize, msg_type: usize, data: usize) -> isize {
-        unsafe { syscall3(syscall_nr::IPC_SEND, to_pid, msg_type, data) }
+    /// Send a fixed-size IPC message to another process.
+    ///
+    /// `dst_pid` is the target process PID.
+    /// `msg` is a mutable reference to the message (kernel fills in src_pid).
+    ///
+    /// Returns 0 on success, -1 on error.
+    pub fn send(dst_pid: usize, msg: &mut IpcMessage) -> isize {
+        unsafe { syscall2(syscall_nr::IPC_SEND, dst_pid, msg as *mut IpcMessage as usize) }
     }
 
-    pub fn recv_msg(from_pid: usize) -> isize {
-        unsafe { syscall2(syscall_nr::IPC_RECV, from_pid, 0) }
+    /// Receive a message from this process's IPC queue.
+    ///
+    /// `buf` is a mutable reference to a buffer that will receive the message.
+    /// Returns 64 (bytes copied) on success, -1 if queue empty.
+    pub fn recv(buf: &mut IpcMessage) -> isize {
+        unsafe { syscall2(syscall_nr::IPC_RECV, buf as *mut IpcMessage as usize, 0) }
     }
 }
