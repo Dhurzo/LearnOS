@@ -11,7 +11,9 @@
  * - align key sections to page boundaries
  */
 
-/* Entry point - first function executed when kernel boots */
+/* Entry point — symbol used by debuggers and ELF loaders.
+ * QEMU -kernel uses the PVH note entry (pvh_start), not this field.
+ */
 ENTRY(_start)
 
 /* ELF64 output consumed directly by QEMU `-kernel` */

@@ -133,12 +133,16 @@ Output: `target/pvh-kernel` (67KB ELF64)
 ## Running
 
 ```bash
-qemu-system-x86_64 -kernel target/pvh-kernel -m 128 -machine q35 -vga std -display gtk
+qemu-system-x86_64 -kernel target/pvh-kernel -m 128M -machine pc-q35-9.2 -vga std
 ```
+
+> **Note**: QEMU 10.x dropped `-kernel` ELF support on the default `q35` machine.
+> Use `pc-q35-9.2` (pre-10.0) which still supports the PVH boot protocol.
 
 Or use the wrapper:
 ```bash
-./run.sh --gui --interactive
+./run.sh --gui --interactive   # GUI window (default)
+./run.sh --nographic           # Serial console
 ```
 
 ## Expected VGA Output

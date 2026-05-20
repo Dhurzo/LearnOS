@@ -74,6 +74,9 @@ pub mod syscall_nr {
     pub const VGA_WRITE: usize = 7;
     pub const VGA_CLEAR: usize = 8;
     pub const SCHEDULE: usize = 9;
+    /// Get a well-known server PID by type:
+    ///   1 = VGA server, 2 = keyboard server
+    pub const GET_SERVER_PID: usize = 10;
 }
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
@@ -122,6 +125,7 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::GETPID] = Some(sys_getpid);
     table.handlers[syscall_nr::IPC_SEND] = Some(sys_ipc_send);
     table.handlers[syscall_nr::IPC_RECV] = Some(sys_ipc_recv);
+    table.handlers[syscall_nr::GET_SERVER_PID] = Some(sys_get_server_pid);
     table
 };
 
@@ -193,6 +197,14 @@ fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr:
 
 fn sys_getpid(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     process::get_current_pid() as isize
+}
+
+fn sys_get_server_pid(server: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    match server {
+        1 => unsafe { VGA_SERVER_PID as isize },
+        2 => unsafe { KEYBOARD_SERVER_PID as isize },
+        _ => -1,
+    }
 }
 
 // =============================================================================

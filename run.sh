@@ -34,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             GUI_MODE="true"
             shift
             ;;
+        --nographic)
+            GUI_MODE="false"
+            shift
+            ;;
         --interactive)
             INTERACTIVE_MODE="true"
             VERBOSE="true"
@@ -46,6 +50,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --debug        Enable QEMU debug output"
             echo "  --verbose      Show QEMU output"
             echo "  --gui          Use QEMU VGA window (disable -nographic)"
+            echo "  --nographic    Use serial console (no GUI window)"
             echo "  --interactive  Run in foreground without timeout"
             echo "  --timeout N    Set timeout to N seconds (default: 10)"
             echo "  -h, --help     Show this help message"
@@ -98,11 +103,16 @@ echo ""
 
 if [ "$DEBUG_MODE" = "true" ]; then
     echo "Boot method: PVH kernel with debug output"
-    qemu-system-x86_64 -kernel "$KERNEL" -m 128M -machine q35,accel=kvm:tcg -cpu host -d guest_errors,un,int -nographic
+    qemu-system-x86_64 \
+        -kernel "$KERNEL" \
+        -m 128M -machine pc-q35-9.2,accel=kvm:tcg -cpu host \
+        -d guest_errors,unimp,int -nographic
     exit 0
 fi
 
-QEMU_CMD=(qemu-system-x86_64 -kernel "$KERNEL" -m 128M -machine q35,accel=kvm:tcg -cpu host -vga std)
+# QEMU 10.x dropped -kernel for ELF on the default q35 machine type.
+# Use pc-q35-9.2 (pre-10.0) which still supports -kernel with PVH.
+QEMU_CMD=(qemu-system-x86_64 -kernel "$KERNEL" -m 128M -machine pc-q35-9.2,accel=kvm:tcg -cpu host -vga std)
 if [ "$GUI_MODE" != "true" ]; then
     QEMU_CMD+=( -nographic )
 fi

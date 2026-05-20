@@ -63,14 +63,16 @@ pub fn print_vga(s: &str) {
 
 fn serial_write(byte: u8) {
     unsafe {
-        let port_addr = SERIAL_PORT as *const u8;
+        // Wait for transmitter holding register to be empty (bit 5)
         loop {
-            let status = core::ptr::read_volatile(port_addr.add(5));
+            let status: u8;
+            core::arch::asm!("in al, dx", out("al") status, in("dx") SERIAL_PORT + 5, options(nostack));
             if status & 0x20 != 0 {
                 break;
             }
         }
-        core::ptr::write_volatile(port_addr as *mut u8, byte);
+        // Write byte to data port
+        core::arch::asm!("out dx, al", in("dx") SERIAL_PORT, in("al") byte, options(nostack));
     }
 }
 

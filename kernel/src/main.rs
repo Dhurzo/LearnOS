@@ -173,13 +173,11 @@
 use core::panic::PanicInfo;
 
 // Import all kernel modules
-mod elf;
 mod paging;
 mod process;
 mod syscall;
 mod tss;
 mod user_program;
-mod userspace;
 mod vga;
 
 // Import boot.S (contains pvh_start, page tables, GDT)
@@ -201,12 +199,55 @@ use crate::process::PROCESS_TABLE;
 /// - Paging is enabled
 /// - A valid stack exists
 /// - This function NEVER RETURNS (it switches to user space)
+/// Initialize serial port COM1 (0x3F8) for debug output.
+/// Uses proper x86 `out` instructions (not memory-mapped I/O).
+unsafe fn init_serial() {
+    let port = 0x3F8u16;
+    // Set DLAB=1 (divisor latch access)
+    core::arch::asm!("out dx, al", in("dx") port + 3, in("al") 0x80u8, options(nostack));
+    // Set divisor to 1 (115200 baud)
+    core::arch::asm!("out dx, al", in("dx") port + 0, in("al") 0x01u8, options(nostack));
+    core::arch::asm!("out dx, al", in("dx") port + 1, in("al") 0x00u8, options(nostack));
+    // Set DLAB=0, 8n1 mode
+    core::arch::asm!("out dx, al", in("dx") port + 3, in("al") 0x03u8, options(nostack));
+    // Enable FIFO, clear, with 14-byte threshold
+    core::arch::asm!("out dx, al", in("dx") port + 2, in("al") 0xC7u8, options(nostack));
+}
+
+/// Write a byte to serial port COM1 using x86 `out` instruction.
+unsafe fn serial_out(byte: u8) {
+    let port = 0x3F8u16;
+    // Wait for transmitter to be ready
+    loop {
+        let status: u8;
+        core::arch::asm!("in al, dx", out("al") status, in("dx") port + 5, options(nostack));
+        if status & 0x20 != 0 {
+            break;
+        }
+    }
+    core::arch::asm!("out dx, al", in("dx") port, in("al") byte, options(nostack));
+}
+
+/// Write a string to serial COM1 for debug output.
+unsafe fn serial_puts(s: &str) {
+    for &byte in s.as_bytes() {
+        serial_out(byte);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Init serial first thing for debug output
+    unsafe {
+        init_serial();
+        serial_puts("S1\n");  // Signal 1: entered _start
+    }
+
     // Write '1' to VGA to show we entered _start (Rust kernel entry)
     unsafe {
         core::ptr::write_volatile(0xB8000 as *mut u8, b'1');
         core::ptr::write_volatile(0xB8001 as *mut u8, 0x0A); // Bright green
+        serial_puts("S2\n");  // Signal 2: VGA write done
     }
 
     // Write '2' to VGA to show we got past module init
