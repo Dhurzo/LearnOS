@@ -185,6 +185,10 @@ core::arch::global_asm!(include_str!("boot.S"));
 
 use crate::process::PROCESS_TABLE;
 
+extern "C" {
+    static gdt64: u8;
+}
+
 /// ============================================================================
 /// KERNEL ENTRY POINT (_start)
 /// ============================================================================
@@ -289,6 +293,9 @@ pub extern "C" fn _start() -> ! {
     // Without it, ring-3->ring-0 transitions would corrupt the kernel!
     unsafe {
         crate::tss::init();
+        // Initialize the per-process syscall kernel stack pointer.
+        // Without this, syscall_entry loads RSP=0 on the first syscall from user space.
+        crate::tss::CURRENT_KERNEL_RSP = crate::tss::kernel_stack_top();
     }
 
     // ============================================================================
@@ -419,6 +426,42 @@ pub extern "C" fn _start() -> ! {
             "out 0x21, al",     // Write back — all other IRQs masked
             options(nostack),
         );
+    }
+
+    // Dump IDT entry for timer (vector 0x20) at 0x200200
+    unsafe {
+        let idt_entry = 0x200200 as *const u64;
+        vga::serial_print_hex("IDT[0x20][0]", *idt_entry);
+        vga::serial_print_hex("IDT[0x20][1]", *idt_entry.add(1));
+
+        let gdt = &gdt64 as *const u8 as *const u64;
+        vga::serial_print_hex("GDT[0x08]", *gdt.add(1));
+        vga::serial_print_hex("GDT[0x10]", *gdt.add(2));
+        vga::serial_print_hex("GDT[0x18]", *gdt.add(3));
+        vga::serial_print_hex("GDT[0x20]", *gdt.add(4));
+        vga::serial_print_hex("GDT[0x28]", *gdt.add(5));
+        vga::serial_print_hex("GDT[0x30]", *gdt.add(6));
+        vga::serial_print_hex("TSS.RSP0", crate::tss::TSS.rsp0());
+        vga::serial_print_hex("TSS.IST1", crate::tss::TSS.ist1());
+
+        let pt = &raw mut PROCESS_TABLE;
+        if let Some(init_proc) = (*pt).get_mut(3) {
+            let cr3 = init_proc.cr3;
+            vga::serial_print_hex("PROC.CR3", cr3);
+
+            let pml4e0 = paging::read_pt_entry(cr3, 0);
+            vga::serial_print_hex("PML4[0]", pml4e0);
+
+            let pdpt = pml4e0 & 0x000F_FFFF_FFFF_F000;
+            let pdpte0 = paging::read_pt_entry(pdpt, 0);
+            vga::serial_print_hex("PDPT[0]", pdpte0);
+
+            let pd = pdpte0 & 0x000F_FFFF_FFFF_F000;
+            vga::serial_print_hex("PD[0]", paging::read_pt_entry(pd, 0));
+            vga::serial_print_hex("PD[1]", paging::read_pt_entry(pd, 1));
+            vga::serial_print_hex("PD[2]", paging::read_pt_entry(pd, 2));
+            vga::serial_print_hex("PD[7]", paging::read_pt_entry(pd, 7));
+        }
     }
 
     vga::serial_print("\n[OK] IDT configured\n");

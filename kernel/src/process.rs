@@ -562,6 +562,8 @@ pub fn schedule_init() {
                     let entry = p.entry_point;
                     let stack = p.registers.rsp;
                     let pid = p.pid;
+                    let cr3 = p.cr3;
+                    let kernel_stack_top = p.kernel_stack_top;
 
                     // Mark as running
                     if let Some(p_mut) = pt.get_mut(pid) {
@@ -570,7 +572,7 @@ pub fn schedule_init() {
                     set_current_pid(pid);
 
                     // DO THE ACTUAL SWITCH!
-                    schedule_user(entry, stack);
+                    schedule_user(entry, stack, cr3, kernel_stack_top);
                 }
             }
         }
@@ -600,13 +602,22 @@ pub fn schedule_init() {
 ///
 /// * `entry` - User process entry point (RIP)
 /// * `stack` - User stack pointer (RSP)
+/// * `cr3` - Physical address of process PML4 (loaded into CR3)
+/// * `kernel_stack_top` - Top of per-process kernel stack (for TSS.RSP0 and syscall)
 ///
 /// # Safety
 ///
-/// Modifies CPU privilege level. Never returns.
-fn schedule_user(entry: u64, stack: u64) {
+/// Modifies CPU privilege level and page tables. Never returns.
+fn schedule_user(entry: u64, stack: u64, cr3: u64, kernel_stack_top: u64) {
     unsafe {
+        crate::tss::TSS.set_rsp0(kernel_stack_top);
+        crate::tss::CURRENT_KERNEL_RSP = kernel_stack_top;
+
         core::arch::asm!(
+            // Load per-process page tables so the CPU uses the correct
+            // code mapping at 0x400000 and user stack at 0xFFF000.
+            "mov cr3, {cr3}",
+
             // Build iretq frame on stack (reverse order):
             "push 0x23",        // SS = ring-3 data segment | RPL3
             "push {stack}",     // User RSP
@@ -621,6 +632,7 @@ fn schedule_user(entry: u64, stack: u64) {
 
             // iretq → pops RIP, CS, RFLAGS, RSP, SS and enters ring 3
             "iretq",
+            cr3 = in(reg) cr3,
             stack = in(reg) stack,
             entry = in(reg) entry,
             rflags = in(reg) 0x202u64,   // IF=1, reserved bits set

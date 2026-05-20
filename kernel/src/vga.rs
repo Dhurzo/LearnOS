@@ -81,3 +81,23 @@ pub fn serial_print(s: &str) {
         serial_write(byte);
     }
 }
+
+fn hex_nibble(v: u8) -> u8 {
+    if v < 10 { b'0' + v } else { b'A' + v - 10 }
+}
+
+fn write_hex_u64(val: u64) {
+    for i in (0..16).rev() {
+        serial_write(hex_nibble(((val >> (i * 4)) & 0xF) as u8));
+    }
+}
+
+pub fn serial_print_hex(label: &str, val: u64) {
+    for &b in label.as_bytes() {
+        serial_write(b);
+    }
+    serial_write(b':');
+    serial_write(b' ');
+    write_hex_u64(val);
+    serial_write(b'\n');
+}

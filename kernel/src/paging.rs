@@ -203,22 +203,30 @@ pub fn create_address_space(code_phys: u64) -> u64 {
         let pdpt = alloc_zeroed_frame();
         let pdpt_ent = (pdpt & 0x000FFFFFFFFFF000)
             | page_flags::PRESENT
-            | page_flags::WRITABLE;
+            | page_flags::WRITABLE
+            | page_flags::USER_ACCESS;
         write_pt_entry(pml4, 0, pdpt_ent);
 
         // === Level 2: PD ===
         let pd = alloc_zeroed_frame();
         let pd_ent = (pd & 0x000FFFFFFFFFF000)
             | page_flags::PRESENT
-            | page_flags::WRITABLE;
+            | page_flags::WRITABLE
+            | page_flags::USER_ACCESS;
         write_pt_entry(pdpt, 0, pd_ent);
 
-        // --- PD[0]: identity map 0x000000-0x1FFFFF (kernel code, U=0) ---
-        // 2MB huge page: Present | Writable | Large (no User)
-        write_pt_entry(pd, 0, 0x000000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::LARGE));
+        // --- PD[0]: identity map 0x000000-0x1FFFFF (kernel code) ---
+        // USER_ACCESS required: when the timer fires at CPL=3, the CPU must read
+        // the GDT (code segment descriptor) and TSS (for stack switch) which live
+        // in this region.  Without U=1 the CPU cannot complete the privilege-level
+        // transition and raises #GP(0x0102) referencing the IDT gate.
+        write_pt_entry(pd, 0, 0x000000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS | page_flags::LARGE));
 
-        // --- PD[1]: identity map 0x200000-0x3FFFFF (kernel data+IDT, U=0) ---
-        write_pt_entry(pd, 1, 0x200000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::LARGE));
+        // --- PD[1]: identity map 0x200000-0x3FFFFF (kernel data + IDT) ---
+        // USER_ACCESS required: the IDT itself lives at 0x200000.  The CPU reads
+        // the IDT gate descriptor before switching CPL, so the page must be
+        // accessible while the processor is still at CPL=3.
+        write_pt_entry(pd, 1, 0x200000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS | page_flags::LARGE));
 
         // --- PD[2]: user code region 0x400000-0x5FFFFF → 4KB PT ---
         let pt_code = alloc_zeroed_frame();
@@ -332,11 +340,10 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     } else {
         // Allocate a new PDPT frame and link it into the PML4
         let frame = alloc_zeroed_frame();
-        write_pt_entry(
-            pml4_phys,
-            pml4_idx,
-            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
-        );
+        // Propagate USER_ACCESS from the PTE flags up through intermediate entries
+        let iflags = page_flags::PRESENT | page_flags::WRITABLE
+            | (flags & page_flags::USER_ACCESS);
+        write_pt_entry(pml4_phys, pml4_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
 
@@ -348,11 +355,9 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
         pdpte & 0x000FFFFFFFFFF000
     } else {
         let frame = alloc_zeroed_frame();
-        write_pt_entry(
-            pdpt,
-            pdpt_idx,
-            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
-        );
+        let iflags = page_flags::PRESENT | page_flags::WRITABLE
+            | (flags & page_flags::USER_ACCESS);
+        write_pt_entry(pdpt, pdpt_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
 
@@ -367,11 +372,9 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
         pde & 0x000FFFFFFFFFF000
     } else {
         let frame = alloc_zeroed_frame();
-        write_pt_entry(
-            pd,
-            pd_idx,
-            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
-        );
+        let iflags = page_flags::PRESENT | page_flags::WRITABLE
+            | (flags & page_flags::USER_ACCESS);
+        write_pt_entry(pd, pd_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
 

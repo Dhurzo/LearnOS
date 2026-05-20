@@ -78,9 +78,30 @@ impl TaskStateSegment {
         self.data[102..104].copy_from_slice(&bytes);
     }
 
+    /// Set IST1 (Interrupt Stack Table entry 1).
+    ///
+    /// Used by the double-fault handler so it runs on a known-good stack.
+    /// IST1 is at bytes 36-43 in the TSS.
+    pub fn set_ist1(&mut self, stack_top: u64) {
+        let bytes = stack_top.to_le_bytes();
+        self.data[36..44].copy_from_slice(&bytes);
+    }
+
     /// Get the base address of this TSS.
     pub fn base_address(&self) -> u64 {
         self as *const Self as u64
+    }
+
+    pub fn rsp0(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.data[4..12]);
+        u64::from_le_bytes(bytes)
+    }
+
+    pub fn ist1(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.data[36..44]);
+        u64::from_le_bytes(bytes)
     }
 }
 
@@ -102,6 +123,19 @@ pub struct KernelStack {
 
 /// Global kernel stack instance.
 pub static mut KERNEL_STACK: KernelStack = KernelStack { data: [0u8; 4096] };
+
+/// A dedicated stack for the double-fault handler.
+///
+/// The double-fault handler uses IST1 (Interrupt Stack Table entry 1)
+/// so it always runs on a known-good stack. Without IST, a double fault
+/// caused by a corrupt stack pointer would itself triple-fault.
+#[repr(C, align(16))]
+pub struct DoubleFaultStack {
+    data: [u8; 4096],
+}
+
+/// Global double-fault stack instance.
+pub static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack { data: [0u8; 4096] };
 
 /// Kernel stack pointer for `syscall` entry.
 ///
@@ -205,8 +239,9 @@ unsafe fn write_tss_descriptor(gdt_base: *mut u64) {
 /// Called once during kernel boot to:
 /// 1. Set the kernel stack for ring-3→ring-0 transitions
 /// 2. Disable user-mode I/O port access
-/// 3. Write the TSS descriptor into the GDT
-/// 4. Load the task register (TR) with `ltr`
+/// 3. Set the double-fault IST1 stack
+/// 4. Write the TSS descriptor into the GDT
+/// 5. Load the task register (TR) with `ltr`
 ///
 /// # Safety
 ///
@@ -221,10 +256,14 @@ pub unsafe fn init() {
     // 2. Set IOPB = TSS size to disable user I/O port access
     TSS.set_iopb(TSS_SIZE as u16);
 
-    // 3. Publish kernel stack pointer for syscall entry assembly
+    // 3. Set IST1 to the double-fault stack top
+    let df_top = (&DOUBLE_FAULT_STACK as *const DoubleFaultStack as u64) + 4096;
+    TSS.set_ist1(df_top);
+
+    // 4. Publish kernel stack pointer for syscall entry assembly
     KERNEL_RSP = stack_top;
 
-    // 4. Get GDT base address (exported by boot.S)
+    // 5. Get GDT base address (exported by boot.S)
     extern "C" {
         static gdt64: u8;
     }

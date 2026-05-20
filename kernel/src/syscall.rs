@@ -519,12 +519,54 @@ core::arch::global_asm!(
     // RSP now points to interrupt frame: RIP, CS, RFLAGS, RSP, SS
     // iretq pops these and returns to ring 3
     "    iretq",
+
+    // =========================================================================
+    // #GP (GENERAL PROTECTION FAULT) ENTRY POINT (vector 0x0D)
+    // =========================================================================
+    //
+    // Called when the CPU detects a protection violation. Has an error code.
+    //
+    // On entry (ring 3 → ring 0, CPU has switched stacks via TSS.RSP0):
+    //   RSP+0: error code
+    //   RSP+8: RIP
+    //   RSP+16: CS
+    //   RSP+24: RFLAGS
+    //   RSP+32: user RSP
+    //   RSP+40: user SS
+    //
+    // We pass RSP (the frame pointer) to the Rust handler and halt.
+    ".globl gp_entry",
+    ".type gp_entry, @function",
+    "gp_entry:",
+    "    mov rdi, rsp",
+    "    call gp_handler",
+    "1:  hlt",
+    "    jmp 1b",
+
+    // =========================================================================
+    // DOUBLE FAULT ENTRY POINT (vector 0x08)
+    // =========================================================================
+    //
+    // Called when the CPU encounters a fault while trying to deliver another
+    // exception. Uses IST1 (Interrupt Stack Table) so it runs on a known-good
+    // stack regardless of kernel-stack state.
+    //
+    // Same stack layout as #GP (error code + interrupt frame).
+    ".globl df_entry",
+    ".type df_entry, @function",
+    "df_entry:",
+    "    mov rdi, rsp",
+    "    call df_handler",
+    "1:  hlt",
+    "    jmp 1b",
 );
 
 extern "C" {
     static syscall_entry: u8;
     static timer_entry: u8;
     static keyboard_entry: u8;
+    static gp_entry: u8;
+    static df_entry: u8;
 }
 
 // =============================================================================
@@ -768,6 +810,83 @@ pub unsafe extern "C" fn keyboard_irq_handler() {
 }
 
 // =============================================================================
+// EXCEPTION HANDLERS (diagnostic)
+// =============================================================================
+
+/// #GP handler — writes error code to VGA at known position, then halts.
+///
+/// We write directly to VGA memory (0xB800A+) instead of using serial,
+/// because serial output may not be reliable at the point of fault.
+/// The error code can be read from the QEMU monitor after the crash:
+///   `xp /16bx 0xB800A`
+///
+/// `frame` points to the interrupt frame on the kernel stack:
+///   frame[0] = error code
+///   frame[1] = RIP
+///   frame[2] = CS
+///   frame[3] = RFLAGS
+///   frame[4] = user RSP
+///   frame[5] = user SS
+#[no_mangle]
+pub unsafe extern "C" fn gp_handler(frame: *mut u64) {
+    // Write "GP" header at VGA row 0, col 5 (offset 10)
+    core::ptr::write_volatile(0xB800A as *mut u8, b'G');
+    core::ptr::write_volatile(0xB800B as *mut u8, 0x0C);
+    core::ptr::write_volatile(0xB800C as *mut u8, b'P');
+    core::ptr::write_volatile(0xB800D as *mut u8, 0x0C);
+
+    // Write error code as hex digits at VGA offset 0x10
+    let err = *frame;
+    for i in 0..16 {
+        let nibble = ((err >> (60 - i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        core::ptr::write_volatile((0xB810 + i * 2) as *mut u8, c);
+        core::ptr::write_volatile((0xB811 + i * 2) as *mut u8, 0x0C);
+    }
+
+    // Write RIP as hex digits at VGA offset 0x30
+    let rip = *frame.add(1);
+    for i in 0..16 {
+        let nibble = ((rip >> (60 - i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        core::ptr::write_volatile((0xB830 + i * 2) as *mut u8, c);
+        core::ptr::write_volatile((0xB831 + i * 2) as *mut u8, 0x0C);
+    }
+
+    loop {}
+}
+
+/// Double-fault handler — writes "DF" to VGA, then halts.
+#[no_mangle]
+pub unsafe extern "C" fn df_handler(frame: *mut u64) {
+    // Write "DF" header at VGA row 0, col 5 (offset 10)
+    core::ptr::write_volatile(0xB800A as *mut u8, b'D');
+    core::ptr::write_volatile(0xB800B as *mut u8, 0x0C);
+    core::ptr::write_volatile(0xB800C as *mut u8, b'F');
+    core::ptr::write_volatile(0xB800D as *mut u8, 0x0C);
+
+    // Write error code as hex digits
+    let err = *frame;
+    for i in 0..16 {
+        let nibble = ((err >> (60 - i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        core::ptr::write_volatile((0xB810 + i * 2) as *mut u8, c);
+        core::ptr::write_volatile((0xB811 + i * 2) as *mut u8, 0x0C);
+    }
+
+    // Write RIP
+    let rip = *frame.add(1);
+    for i in 0..16 {
+        let nibble = ((rip >> (60 - i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        core::ptr::write_volatile((0xB830 + i * 2) as *mut u8, c);
+        core::ptr::write_volatile((0xB831 + i * 2) as *mut u8, 0x0C);
+    }
+
+    loop {}
+}
+
+// =============================================================================
 // IDT SETUP
 // =============================================================================
 
@@ -839,6 +958,17 @@ pub unsafe fn init_idt() {
     let kbd_addr = &keyboard_entry as *const u8 as u64;
     let kbd_entry_idt = IdtEntry::new(kbd_addr, 0x08);
     idt.add(0x21).write(kbd_entry_idt);
+
+    // Vector 0x0D: #GP (General Protection Fault) — diagnostic
+    let gp_addr = &gp_entry as *const u8 as u64;
+    let gp_idt_entry = IdtEntry::new(gp_addr, 0x08);
+    idt.add(0x0D).write(gp_idt_entry);
+
+    // Vector 0x08: Double Fault — diagnostic with IST1
+    let df_addr = &df_entry as *const u8 as u64;
+    let mut df_idt_entry = IdtEntry::new(df_addr, 0x08);
+    df_idt_entry.ist = 1; // use IST1 (our double-fault stack)
+    idt.add(0x08).write(df_idt_entry);
 
     #[repr(C, packed)]
     struct IdtPtr {

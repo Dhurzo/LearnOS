@@ -93,10 +93,10 @@ long_mode_start:
 .global gdt64
 gdt64:
     .quad 0x0000000000000000       /* 0x00: Null */
-    .quad 0x00AF9A000000FFFF       /* 0x08: Ring 0 Code (R/X) */
-    .quad 0x00AF92000000FFFF       /* 0x10: Ring 0 Data (R/W) */
-    .quad 0x00AFFA000000FFFF       /* 0x18: Ring 3 Code (R/X, DPL=3) */
-    .quad 0x00AFF2000000FFFF       /* 0x20: Ring 3 Data (R/W, DPL=3) */
+    .quad 0x00209A0000000000       /* 0x08: Ring 0 Code (64-bit long mode) */
+    .quad 0x0000920000000000       /* 0x10: Ring 0 Data */
+    .quad 0x0020FA0000000000       /* 0x18: Ring 3 Code (64-bit long mode) */
+    .quad 0x0000F20000000000       /* 0x20: Ring 3 Data */
     .quad 0x0000000000000000       /* 0x28: TSS desc low (Rust fills in) */
     .quad 0x0000000000000000       /* 0x30: TSS desc high (Rust fills in) */
 gdt64_end:
