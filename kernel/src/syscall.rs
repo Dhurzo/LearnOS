@@ -47,6 +47,22 @@
 use crate::process;
 use crate::vga;
 
+/// PID of the user-space VGA display server (0 = not yet spawned).
+static mut VGA_SERVER_PID: u16 = 0;
+
+/// PID of the user-space keyboard input server (0 = not yet spawned).
+static mut KEYBOARD_SERVER_PID: u16 = 0;
+
+/// Set the PID of the VGA server (called during boot after spawning it).
+pub fn set_vga_server_pid(pid: u16) {
+    unsafe { VGA_SERVER_PID = pid };
+}
+
+/// Set the PID of the keyboard server (called during boot after spawning it).
+pub fn set_keyboard_server_pid(pid: u16) {
+    unsafe { KEYBOARD_SERVER_PID = pid };
+}
+
 pub mod syscall_nr {
     pub const EXIT: usize = 0;
     pub const WRITE: usize = 1;
@@ -126,13 +142,46 @@ fn sys_exit(_code: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: u
 }
 
 fn sys_vga_write(byte: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    vga::write_byte(byte as u8);
-    0
+    let vga_pid = unsafe { VGA_SERVER_PID };
+    if vga_pid == 0 {
+        // VGA server not yet running — fall back to direct write (early boot / panic)
+        vga::write_byte(byte as u8);
+        return 0;
+    }
+    // Forward to VGA server via IPC (msg_type = 1 = MSG_VGA_PRINT)
+    let msg = process::IpcMessage::new(0, 1, {
+        let mut d = [0u8; 60];
+        d[0] = byte as u8;
+        d
+    });
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(vga_pid) {
+            if p.ipc_push(msg) {
+                return 0;
+            }
+        }
+    }
+    -1
 }
 
 fn sys_vga_clear(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    vga::clear_screen();
-    0
+    let vga_pid = unsafe { VGA_SERVER_PID };
+    if vga_pid == 0 {
+        vga::clear_screen();
+        return 0;
+    }
+    // Forward to VGA server via IPC (msg_type = 2 = MSG_VGA_CLEAR)
+    let msg = process::IpcMessage::new(0, 2, [0u8; 60]);
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(vga_pid) {
+            if p.ipc_push(msg) {
+                return 0;
+            }
+        }
+    }
+    -1
 }
 
 fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
@@ -390,11 +439,80 @@ core::arch::global_asm!(
     // RSP now points to interrupt frame (RIP, CS, RFLAGS, RSP, SS)
     // which may have been modified for a different process
     "    iretq",
+    "",
+    // =========================================================================
+    // KEYBOARD INTERRUPT ENTRY POINT (IRQ1, vector 0x21)
+    // =========================================================================
+    //
+    // The PS/2 keyboard controller generates IRQ1 every time a key is pressed
+    // or released. The PIC (Programmable Interrupt Controller) delivers this
+    // as interrupt vector 0x21 (after our PIC remap in main.rs).
+    //
+    // When this interrupt fires while the CPU is in ring 3 (user mode):
+    //   1. CPU reads RSP0 from the TSS → switches to kernel stack
+    //   2. CPU pushes SS, user RSP, RFLAGS, CS, RIP onto kernel stack
+    //   3. CPU jumps here via IDT entry 0x21 (CS = 0x08 = ring 0 code)
+    //
+    // We must:
+    //   1. Save all 15 general-purpose registers
+    //   2. Call keyboard_irq_handler() — reads port 0x60, forwards via IPC
+    //   3. Restore all GP registers
+    //   4. iretq back to user mode (to whatever process was running)
+    //
+    // Why does the IRQ handler read port 0x60 instead of the keyboard server?
+    //   The PS/2 controller has a 1-byte input buffer. If we don't read it
+    //   promptly, a second keystroke overwrites the first (lost input).
+    //   Port I/O (in/out) is a privileged instruction — only the kernel
+    //   can do it. So the kernel reads the scancode and forwards it via IPC
+    //   to the user-space keyboard server.
+    ".globl keyboard_entry",
+    ".type keyboard_entry, @function",
+    "keyboard_entry:",
+    // Save all 15 GP registers on the kernel stack (same order as timer_entry)
+    "    push rax",
+    "    push rcx",
+    "    push rdx",
+    "    push rbx",
+    "    push rbp",
+    "    push rsi",
+    "    push rdi",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    // Pass RSP as argument to the Rust handler (points to saved r15)
+    // The handler reads scancode from port 0x60 and pushes IPC message
+    "    mov rdi, rsp",
+    "    call keyboard_irq_handler",
+    // Restore GP registers (reverse order)
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop r11",
+    "    pop r10",
+    "    pop r9",
+    "    pop r8",
+    "    pop rdi",
+    "    pop rsi",
+    "    pop rbp",
+    "    pop rbx",
+    "    pop rdx",
+    "    pop rcx",
+    "    pop rax",
+    // RSP now points to interrupt frame: RIP, CS, RFLAGS, RSP, SS
+    // iretq pops these and returns to ring 3
+    "    iretq",
 );
 
 extern "C" {
     static syscall_entry: u8;
     static timer_entry: u8;
+    static keyboard_entry: u8;
 }
 
 // =============================================================================
@@ -567,6 +685,77 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
 }
 
 // =============================================================================
+// KEYBOARD IRQ HANDLER
+// =============================================================================
+//
+// This is called from the keyboard_entry assembly when IRQ1 fires.
+// Its job is minimal by design (microkernel philosophy):
+//
+//   1. Read the scancode from the PS/2 data port (0x60)
+//   2. Forward it to the user-space keyboard server via IPC
+//   3. Send End-Of-Interrupt to the PIC
+//
+// Why does step 1 happen in the kernel and not in user space?
+//
+//   The PS/2 controller has a tiny 1-byte hardware buffer. If the CPU
+//   doesn't read it before the next keystroke arrives, the old byte is
+//   lost — overwritten by the new one. Port I/O (in/out instructions)
+//   is privileged (ring 0 only), so only the kernel can access it.
+//
+//   The solution: the kernel reads the raw scancode in ~microseconds
+//   (fast enough for any human typing speed), then forwards it to the
+//   user-space keyboard server which does the slow work of decoding
+//   and buffering. The kernel stays minimal and fast.
+//
+// This is the classic microkernel pattern: the kernel handles the
+// time-critical hardware access, but the driver logic lives in a
+// user-space process that could crash without bringing down the system.
+
+/// Read the keyboard scancode from port 0x60 and forward to the keyboard
+/// server via IPC.  Called from `keyboard_entry` assembly (IRQ1).
+///
+/// # Timing constraint
+///
+/// This must execute quickly — the PS/2 controller only buffers one byte.
+/// If a second keystroke arrives before we read port 0x60, the first is
+/// lost. In practice, even with IPC and scheduling overhead, we're well
+/// within the ~16ms between keystrokes at peak typing speed.
+#[no_mangle]
+pub unsafe extern "C" fn keyboard_irq_handler() {
+    // ── Step 1: Read scancode from PS/2 data port ──
+    // Port 0x60 is the PS/2 data port. Reading it gives us the scancode
+    // of the most recent key press or release. The `in` instruction is
+    // privileged — only ring 0 code can execute it. This is why the
+    // keyboard server (which runs at ring 3) can't read it directly.
+    let scancode: u8;
+    core::arch::asm!("in al, 0x60", out("al") scancode, options(nostack));
+
+    // ── Step 2: Forward raw scancode to keyboard server via IPC ──
+    // We push an IPC message (type 3 = MSG_KEY_SCANCODE) directly into
+    // the keyboard server's kernel-side queue. No syscall needed — we're
+    // already in kernel mode. This is an "in-kernel IPC" optimization:
+    // the sender (IRQ handler) writes directly to the receiver's queue.
+    let kb_pid = KEYBOARD_SERVER_PID;
+    if kb_pid != 0 {
+        let msg = process::IpcMessage::new(0, 3 /* MSG_KEY_SCANCODE */, {
+            let mut d = [0u8; 60];
+            d[0] = scancode;
+            d
+        });
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(kb_pid) {
+            let _ = p.ipc_push(msg);
+        }
+    }
+
+    // ── Step 3: Send End-Of-Interrupt to the master PIC ──
+    // Writing 0x20 to port 0x20 tells the 8259A PIC that we've finished
+    // handling this interrupt. Without this, the PIC won't deliver any
+    // more interrupts (including timer ticks — the system freezes).
+    core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nostack));
+}
+
+// =============================================================================
 // IDT SETUP
 // =============================================================================
 
@@ -633,6 +822,11 @@ pub unsafe fn init_idt() {
     let timer_addr = &timer_entry as *const u8 as u64;
     let timer_entry_idt = IdtEntry::new(timer_addr, 0x08);
     idt.add(0x20).write(timer_entry_idt);
+
+    // Vector 0x21: keyboard IRQ1 → keyboard_entry assembly
+    let kbd_addr = &keyboard_entry as *const u8 as u64;
+    let kbd_entry_idt = IdtEntry::new(kbd_addr, 0x08);
+    idt.add(0x21).write(kbd_entry_idt);
 
     #[repr(C, packed)]
     struct IdtPtr {

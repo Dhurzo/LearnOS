@@ -173,10 +173,7 @@
 use core::panic::PanicInfo;
 
 // Import all kernel modules
-mod device_manager;
 mod elf;
-mod ipc;
-mod keyboard;
 mod paging;
 mod process;
 mod syscall;
@@ -188,8 +185,6 @@ mod vga;
 // Import boot.S (contains pvh_start, page tables, GDT)
 core::arch::global_asm!(include_str!("boot.S"));
 
-// Use the device manager for hardware access
-use crate::device_manager::get_device_manager;
 use crate::process::PROCESS_TABLE;
 
 /// ============================================================================
@@ -214,16 +209,11 @@ pub extern "C" fn _start() -> ! {
         core::ptr::write_volatile(0xB8001 as *mut u8, 0x0A); // Bright green
     }
 
-    // Initialize the device manager and VGA
-    let device_manager = get_device_manager();
-
-    // Write '2' to VGA after getting device manager
+    // Write '2' to VGA to show we got past module init
     unsafe {
         core::ptr::write_volatile(0xB8002 as *mut u8, b'2');
         core::ptr::write_volatile(0xB8003 as *mut u8, 0x0A);
     }
-
-    device_manager.initialize_vga();
 
     // Write '3' to VGA after VGA init
     unsafe {
@@ -289,34 +279,72 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         let pt = &mut *(&raw mut PROCESS_TABLE as *mut process::ProcessTable);
 
+        // --- Spawn VGA server (PID 1) before any client processes ---
+        let vga_entry = crate::user_program::vga_server::vga_main as u64;
+        if let Some(vga_pid) = pt.spawn(vga_entry, "vga-server") {
+            // Map the physical VGA text buffer into the VGA server's address space
+            if let Some(vga_proc) = pt.get_mut(vga_pid) {
+                paging::map_phys_page(
+                    vga_proc.cr3,
+                    paging::VGA_BUFFER_VADDR,
+                    paging::VGA_PHYS_ADDR,
+                    paging::page_flags::PRESENT
+                        | paging::page_flags::WRITABLE
+                        | paging::page_flags::USER_ACCESS
+                        | paging::page_flags::CACHE_DISABLE,
+                );
+                // Register VGA_SERVER_PID so sys_vga_write can forward via IPC
+                crate::syscall::set_vga_server_pid(vga_pid);
+            }
+            pt.set_running(vga_pid);
+            process::set_current_pid(vga_pid);
+            // Write 'V' for VGA server
+            unsafe {
+                core::ptr::write_volatile(0xB8008 as *mut u8, b'V');
+                core::ptr::write_volatile(0xB8009 as *mut u8, 0x0A); // Bright green
+            }
+        }
+
+        // --- Spawn keyboard server (PID 2) ---
+        let kbd_entry = crate::user_program::keyboard_server::keyboard_main as u64;
+        if let Some(kbd_pid) = pt.spawn(kbd_entry, "keyboard") {
+            pt.set_ready(kbd_pid);
+            crate::syscall::set_keyboard_server_pid(kbd_pid);
+            unsafe {
+                core::ptr::write_volatile(0xB800A as *mut u8, b'K');
+                core::ptr::write_volatile(0xB800B as *mut u8, 0x0A);
+            }
+        }
+
+        // --- Spawn init process ---
         let init_entry = crate::user_program::init::init_main as u64;
         if let Some(init_pid) = pt.spawn(init_entry, "init") {
-            device_manager.print_string("Init PID 1: RUNNING\n");
+            vga::serial_print("Init PID 1: RUNNING\n");
             pt.set_running(init_pid);
             process::set_current_pid(init_pid);
             // Write 'I' for Init
             unsafe {
-                core::ptr::write_volatile(0xB8008 as *mut u8, b'I');
-                core::ptr::write_volatile(0xB8009 as *mut u8, 0x0C); // Bright red
+                core::ptr::write_volatile(0xB800C as *mut u8, b'I');
+                core::ptr::write_volatile(0xB800D as *mut u8, 0x0C); // Bright red
             }
         }
 
         let shell_entry = crate::user_program::shell::shell_main as u64;
         if let Some(shell_pid) = pt.spawn(shell_entry, "shell") {
-            device_manager.print_string("Shell PID 2: READY\n");
+            vga::serial_print("Shell PID 2: READY\n");
             pt.set_ready(shell_pid);
             // Write 'S' for Shell
             unsafe {
-                core::ptr::write_volatile(0xB800A as *mut u8, b'S');
-                core::ptr::write_volatile(0xB800B as *mut u8, 0x0C);
+                core::ptr::write_volatile(0xB800E as *mut u8, b'S');
+                core::ptr::write_volatile(0xB800F as *mut u8, 0x0C);
             }
         }
     }
 
     // Write '5' to VGA after process creation
     unsafe {
-        core::ptr::write_volatile(0xB800C as *mut u8, b'5');
-        core::ptr::write_volatile(0xB800D as *mut u8, 0x0A);
+        core::ptr::write_volatile(0xB8010 as *mut u8, b'5');
+        core::ptr::write_volatile(0xB8011 as *mut u8, 0x0A);
     }
 
     // ============================================================================
@@ -337,18 +365,29 @@ pub extern "C" fn _start() -> ! {
 
     // Write 'T' for Timer
     unsafe {
-        core::ptr::write_volatile(0xB800E as *mut u8, b'T');
-        core::ptr::write_volatile(0xB800F as *mut u8, 0x0A);
+        core::ptr::write_volatile(0xB8012 as *mut u8, b'T');
+        core::ptr::write_volatile(0xB8013 as *mut u8, 0x0A);
     }
 
-    device_manager.print_string("\n[OK] IDT configured\n");
-    device_manager.print_string("[OK] Timer configured\n");
-    device_manager.print_string("\nSwitching to user space...\n");
+    // Unmask keyboard IRQ1 in the master PIC (clear bit 1)
+    // Also ensure timer IRQ0 (bit 0) remains unmasked.
+    unsafe {
+        core::arch::asm!(
+            "in al, 0x21",      // Read current mask
+            "and al, 0xFC",     // Clear bits 0 (timer) and 1 (keyboard)
+            "out 0x21, al",     // Write back — all other IRQs masked
+            options(nostack),
+        );
+    }
+
+    vga::serial_print("\n[OK] IDT configured\n");
+    vga::serial_print("[OK] Timer configured\n");
+    vga::serial_print("\nSwitching to user space...\n");
 
     // Write 'U' for User mode
     unsafe {
-        core::ptr::write_volatile(0xB8010 as *mut u8, b'U');
-        core::ptr::write_volatile(0xB8011 as *mut u8, 0x0A);
+        core::ptr::write_volatile(0xB8014 as *mut u8, b'U');
+        core::ptr::write_volatile(0xB8015 as *mut u8, 0x0A);
     }
 
     // ============================================================================
@@ -531,33 +570,6 @@ pub extern "C" fn timer_tick() {
             "out 0x20, al", // Send to master PIC
             options(nostack)
         );
-    }
-}
-
-/// ============================================================================
-/// KEYBOARD INTERRUPT HANDLER
-/// ============================================================================
-///
-/// Called when a key is pressed. In a full implementation,
-/// we'd read the key and send it to the focused process.
-///
-/// # Safety
-///
-/// Called from interrupt context.
-#[no_mangle]
-pub extern "C" fn keyboard_irq() {
-    // Read keyboard status (optional)
-    // Read scan code from port 0x60
-
-    // In a full kernel, we'd:
-    // 1. Read scan code from keyboard
-    // 2. Convert to key code
-    // 3. Store in keyboard buffer
-    // 4. Signal waiting process
-
-    // Send EOI
-    unsafe {
-        core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nostack));
     }
 }
 

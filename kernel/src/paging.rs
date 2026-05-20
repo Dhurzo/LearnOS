@@ -68,6 +68,13 @@ pub const USER_VADDR_END: u64 = 0x00007FFFFFFFFFFF;
 /// Must be within a 2MB region that maps to a user-accessible huge page (PD[7]).
 pub const USER_STACK_VADDR: u64 = 0x0000000000FFF000;
 
+/// Virtual address for the VGA text buffer when mapped into a user-space driver.
+/// Uses PD[3] range (0x600000-0x7FFFFF), currently unused in the address-space layout.
+pub const VGA_BUFFER_VADDR: u64 = 0x0000000000600000;
+
+/// Physical address of the VGA text mode buffer (80×25 colour).
+pub const VGA_PHYS_ADDR: u64 = 0xB8000;
+
 /// Stack size (8KB)
 pub const USER_STACK_SIZE: u64 = 0x2000;
 
@@ -249,6 +256,140 @@ pub unsafe fn enable_pge() {
     let cr4: u64;
     core::arch::asm!("mov {0}, cr4", out(reg) cr4, options(nostack));
     core::arch::asm!("mov cr4, {0}", in(reg) (cr4 | 0x80), options(nostack));
+}
+
+// =============================================================================
+// PHYSICAL PAGE MAPPING (for user-space drivers)
+// =============================================================================
+//
+// In a microkernel, even device drivers are user-space processes. To let a
+// device driver (like the VGA server) access hardware memory directly, we
+// need to map physical device memory into its address space.
+//
+// This is what map_phys_page does: it walks a process's page tables and
+// inserts a 4KB mapping from a virtual address to a physical address.
+//
+// The key insight: x86-64 uses a 4-level page table hierarchy:
+//
+//   Virtual Address (48 bits used):
+//   ┌────────────┬────────────┬────────────┬────────────┬──────────┐
+//   │   PML4[9]  │  PDPT[9]   │   PD[9]    │   PT[9]    │  Offset  │
+//   │   47:39    │   38:30    │   29:21    │   20:12    │   11:0   │
+//   └────────────┴────────────┴────────────┴────────────┴──────────┘
+//
+//   PML4[0] → PDPT (Page Directory Pointer Table)
+//   PDPT[0] → PD   (Page Directory)
+//   PD[N]   → PT   (Page Table)    — OR — 2MB huge page
+//   PT[M]   → 4KB Physical Page
+//
+// Each table has 512 entries (9 bits of index), and each entry is 8 bytes.
+// A full table fits in one 4KB page.
+
+/// Map a physical page into any address space at a given virtual address.
+///
+/// Walks the 4-level page table rooted at `pml4_phys`, allocating any
+/// intermediate tables that do not yet exist, then writes the final PTE
+/// with `phys` and `flags`.
+///
+/// This is a "lazy" page-table walker: if a table at any level doesn't
+/// exist yet (PML4E/PDPTE/PDE not Present), we allocate a new zeroed
+/// frame and point the parent entry at it. This means we don't pre-build
+/// the full page table tree — we build only the parts we need.
+///
+/// Why is identity mapping needed for the frame allocator?
+///   The frames we allocate live in physical memory beyond the 16MB
+///   identity-mapped region. But since the kernel is identity-mapped
+///   at boot (physical address == virtual address), we can access
+///   those frames directly at their physical addresses. If the kernel
+///   used a virtual offset (like 0xFFFF800000000000+), we'd need to
+///   translate here.
+///
+/// # Safety
+///
+/// - `pml4_phys` must be the physical address of a valid PML4 frame.
+/// - `phys` must be 4 KB aligned.
+/// - `virt` is the desired canonical virtual address.
+/// - The caller must ensure no aliasing / double-map violations.
+pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
+    // Extract the 9-bit index for each page-table level from the virtual address.
+    // Each index selects one of 512 entries in its respective table.
+    let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((virt >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((virt >> 12) & 0x1FF) as usize;
+
+    // =========================================================================
+    // LEVEL 4: Walk PML4 → PDPT
+    // =========================================================================
+    // Read the PML4 entry for this virtual address range. If the entry is
+    // Present, it already points to a PDPT frame. If not, we allocate a
+    // new zeroed frame and write the entry — this is the "lazy allocation"
+    // pattern repeated at every level.
+    let pml4e = read_pt_entry(pml4_phys, pml4_idx);
+    let pdpt = if pml4e & page_flags::PRESENT != 0 {
+        // Extract the physical frame address (bits 12-51) from the existing entry
+        pml4e & 0x000FFFFFFFFFF000
+    } else {
+        // Allocate a new PDPT frame and link it into the PML4
+        let frame = alloc_zeroed_frame();
+        write_pt_entry(
+            pml4_phys,
+            pml4_idx,
+            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        frame
+    };
+
+    // =========================================================================
+    // LEVEL 3: Walk PDPT → PD
+    // =========================================================================
+    let pdpte = read_pt_entry(pdpt, pdpt_idx);
+    let pd = if pdpte & page_flags::PRESENT != 0 {
+        pdpte & 0x000FFFFFFFFFF000
+    } else {
+        let frame = alloc_zeroed_frame();
+        write_pt_entry(
+            pdpt,
+            pdpt_idx,
+            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        frame
+    };
+
+    // =========================================================================
+    // LEVEL 2: Walk PD → PT
+    // =========================================================================
+    // Note: We always create a 4KB PT here. In theory, we could use a 2MB
+    // huge page (set the LARGE bit in the PDE), but for device-memory mappings
+    // like the VGA buffer at 0xB8000, a single 4KB page is all we need.
+    let pde = read_pt_entry(pd, pd_idx);
+    let pt = if pde & page_flags::PRESENT != 0 {
+        pde & 0x000FFFFFFFFFF000
+    } else {
+        let frame = alloc_zeroed_frame();
+        write_pt_entry(
+            pd,
+            pd_idx,
+            (frame & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        frame
+    };
+
+    // =========================================================================
+    // LEVEL 1: Write the final 4 KB PTE
+    // =========================================================================
+    // Now we're at the leaf level. The PTE maps a single 4KB physical page
+    // to the virtual address. The `flags` argument typically includes
+    // PRESENT | WRITABLE | USER_ACCESS, and for device memory we also
+    // set CACHE_DISABLE (PCD bit) — because writing to VGA memory with
+    // caching enabled can cause stale reads or unpredictable behaviour.
+    let pte = (phys & 0x000FFFFFFFFFF000) | flags;
+    write_pt_entry(pt, pt_idx, pte);
+
+    // After this, the VGA server (or any user-space driver) can access
+    // its device memory directly via virtual addresses — no syscall needed
+    // for each character write. This is the key performance advantage of
+    // user-space drivers in a microkernel.
 }
 
 // =============================================================================
