@@ -2,6 +2,14 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[macro_export]
+macro_rules! kprintln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!(crate::vga::VgaWriter, $($arg)*);
+    }};
+}
+
 // Constants
 const VGA_BUFFER: u64 = 0xB8000;
 const VGA_COLOR_DEFAULT: u8 = 0x07;

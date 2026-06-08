@@ -95,8 +95,38 @@
 //!
 //! =============================================================================
 
-use crate::paging::{self, MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START};
+use crate::paging::{self, MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START, USER_VADDR_END};
 use core::sync::atomic::{AtomicU16, Ordering};
+
+/// User PID pool size (max concurrent user processes)
+pub const USER_PIDS_COUNT: usize = 16;
+
+/// Slot tracking: tracks which PIDs are in use
+pub static mut USER_PID_POOL: [u16; USER_PIDS_COUNT] = [0; USER_PIDS_COUNT];
+
+/// Allocate a user PID from the pool (linear scan for simplicity).
+/// Returns 0 if pool is full.
+pub fn alloc_user_pid() -> u16 {
+    unsafe {
+        for (i, slot) in USER_PID_POOL.iter_mut().enumerate() {
+            if *slot == 0 {
+                let pid = (i + 1) as u16;
+                *slot = 1;
+                return pid;
+            }
+        }
+    }
+    0
+}
+
+/// Free a user PID slot back to the pool.
+pub fn free_user_pid_slot(pid: u16) {
+    if pid > 0 && (pid as usize) <= USER_PIDS_COUNT {
+        unsafe {
+            USER_PID_POOL[pid as usize - 1] = 0;
+        }
+    }
+}
 
 // =============================================================================
 // IPC Message and Per-Process Queue
@@ -199,6 +229,16 @@ pub struct Process {
     pub ipc_head: usize,
     /// Tail of the IPC ring buffer (next slot to write).
     pub ipc_tail: usize,
+
+    // Phase 4 — Signal handling
+    /// Bitmap of pending signals (bit N = signal N pending).
+    pub signal_pending: u64,
+    /// Registered signal handlers (one per signal number, max 64).
+    pub signal_handlers: [Option<u64>; 64],
+
+    // Phase 4 — Capability-based IPC
+    /// Bitmap of capabilities this process holds (bit N = has capability N).
+    pub capabilities: u64,
 }
 
 /// ============================================================================
@@ -260,7 +300,7 @@ impl Process {
                 Some(MemoryRegion::new(USER_VADDR_START, 0x100000, 0)),
                 Some(MemoryRegion::new(USER_VADDR_START + 0x100000, 0x100000, 0)),
                 Some(MemoryRegion::new(
-                    USER_STACK_VADDR - USER_STACK_SIZE,
+                    USER_STACK_VADDR - (USER_STACK_SIZE as u64),
                     USER_STACK_SIZE,
                     0,
                 )),
@@ -272,6 +312,9 @@ impl Process {
             ipc_queue: [None; IPC_QUEUE_CAPACITY],
             ipc_head: 0,
             ipc_tail: 0,
+            signal_pending: 0,
+            signal_handlers: [None; 64],
+            capabilities: 0,
         }
     }
 
@@ -457,6 +500,157 @@ impl ProcessTable {
             p.state = ProcessState::Ready;
         }
     }
+
+    // =========================================================================
+    // fork_process — Phase 2: Create a child process as a copy of the parent
+    // =========================================================================
+    ///
+    /// Clones the calling process: creates a new PCB with copied registers,
+    /// a COW copy of the page table, and a new PID.  The child gets its own
+    /// kernel stack.
+    ///
+    /// Returns the child's PID, or `None` if the process table is full.
+    pub fn fork_process(&mut self, parent_pid: Pid) -> Option<Pid> {
+        // Extract parent data before any mutable access to self
+        let (parent_entry, parent_name, parent_cr3, parent_regs) = {
+            let parent = self.get(parent_pid)?;
+            (parent.entry_point, parent.name, parent.cr3, parent.registers)
+        };
+
+        let child_pid = self.next_pid;
+        self.next_pid = self.next_pid.wrapping_add(1);
+        if self.next_pid == 0 {
+            return None; // PID wrap-around
+        }
+
+        // Find a free slot
+        let slot = self.processes.iter_mut().find(|p| p.is_none())?;
+
+        // Allocate kernel stack for child
+        let kstack_frame = paging::alloc_frame();
+        if kstack_frame == 0 {
+            return None;
+        }
+        let kernel_stack_top = kstack_frame + 4096;
+
+        // COW copy of the page table
+        let child_cr3 = unsafe { paging::copy_page_table_cow(parent_cr3) };
+
+        let mut child = Process::new(child_pid, parent_entry, parent_name);
+        child.registers = parent_regs;
+        child.cr3 = child_cr3;
+        child.kernel_stack_top = kernel_stack_top;
+        child.state = ProcessState::Ready;
+
+        // Child gets return value 0 from fork
+        child.registers.rax = 0;
+
+        *slot = Some(child);
+        Some(child_pid)
+    }
+
+    // =========================================================================
+    // exec_builtin — Phase 2: Replace process image with a built-in program
+    // =========================================================================
+    ///
+    /// Unmaps the current user pages, allocates a fresh code frame,
+    /// copies the given entry-point code into it, and resets the stack.
+    pub fn exec_builtin(&mut self, pid: Pid, entry: u64, name: &'static str) -> bool {
+        let proc = match self.get_mut(pid) {
+            Some(p) => p,
+            None => return false,
+        };
+        // Unmap old user pages
+        unsafe {
+            paging::munmap_range(proc.cr3, paging::USER_VADDR_LOAD, 0x100000);
+        }
+        // Allocate new code frame and copy entry code
+        let code_frame = paging::alloc_frame();
+        if code_frame == 0 {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(entry as *const u8, code_frame as *mut u8, 4096);
+        }
+        // Remap code at 0x400000
+        unsafe {
+            paging::map_phys_page(
+                proc.cr3,
+                paging::USER_VADDR_LOAD,
+                code_frame,
+                paging::PTE_USER,
+            );
+        }
+        // Reset registers
+        proc.entry_point = entry;
+        proc.registers = ProcessRegisters::default();
+        proc.registers.rsp = paging::USER_STACK_VADDR;
+        proc.registers.rip = entry;
+        proc.name = name;
+        true
+    }
+
+    // =========================================================================
+    // load_elf_into_process — Phase 3: Load an ELF file from the embedded
+    // filesystem and replace the process image with it.
+    // =========================================================================
+    ///
+    /// Opens an ELF binary from the embedded filesystem by path, reads it
+    /// into a kernel buffer, parses and maps its LOAD segments via
+    /// `elf::load_elf`, then resets registers so execution starts at
+    /// the ELF entry point.
+    ///
+    /// Returns `true` on success, `false` if the file was not found,
+    /// is not a valid ELF, or memory allocation fails.
+    pub fn load_elf_into_process(&mut self, pid: Pid, path: &str) -> bool {
+        // 1. Open file in the embedded filesystem
+        let fd = match crate::filesystem::open(pid, path) {
+            Some(fd) => fd,
+            None => return false,
+        };
+
+        // 2. Get file size (cap at 64 KiB for our kernel buffer)
+        let size = match crate::filesystem::file_size(pid, fd) {
+            Some(s) => s,
+            None => {
+                crate::filesystem::close(pid, fd);
+                return false;
+            }
+        };
+        let max_size = size.min(65536);
+
+        // 3. Read entire file into a static kernel buffer
+        let mut buf = [0u8; 65536];
+        let n = match crate::filesystem::read_all(pid, fd, &mut buf[..max_size]) {
+            Some(n) => n,
+            None => {
+                crate::filesystem::close(pid, fd);
+                return false;
+            }
+        };
+
+        // 4. Close the file (we have the data in our buffer now)
+        crate::filesystem::close(pid, fd);
+
+        // 5. Load ELF segments into the process's address space
+        let proc = match self.get_mut(pid) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let result = match unsafe { crate::elf::load_elf(&buf[..n], proc.cr3) } {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+
+        // 6. Reset registers like exec_builtin does
+        proc.entry_point = result.entry;
+        proc.registers = ProcessRegisters::default();
+        proc.registers.rsp = result.stack_top;
+        proc.registers.rip = result.entry;
+
+        true
+    }
 }
 
 /// ============================================================================
@@ -489,7 +683,6 @@ pub fn set_current_pid(pid: Pid) {
     CURRENT_PID.store(pid, Ordering::Release);
 }
 
-/// ============================================================================
 /// Schedule Next Process (Round-Robin)
 /// ============================================================================
 ///

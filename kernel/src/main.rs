@@ -179,6 +179,12 @@ mod syscall;
 mod tss;
 mod user_program;
 mod vga;
+mod interrupt_server;
+mod capability;
+mod elf;
+mod signal;
+mod filesystem;
+mod block_dev;
 
 // Import boot.S (contains pvh_start, page tables, GDT)
 core::arch::global_asm!(include_str!("boot.S"));
@@ -275,7 +281,12 @@ pub extern "C" fn _start() -> ! {
     paging::init_frame_allocator();
 
     // ============================================================================
-    // STEP 1c: ENABLE PAGE GLOBAL ENABLE (CR4.PGE)
+    // STEP 1c: INITIALIZE BLOCK DEVICE (RAM disk)
+    // ============================================================================
+    block_dev::init();
+
+    // ============================================================================
+    // STEP 1d: ENABLE PAGE GLOBAL ENABLE (CR4.PGE)
     // ============================================================================
     // This makes kernel page-table entries with the Global (G) bit survive
     // CR3 writes, so kernel TLB entries don't get flushed on every context
@@ -358,6 +369,8 @@ pub extern "C" fn _start() -> ! {
         if let Some(kbd_pid) = pt.spawn(kbd_entry, "keyboard") {
             pt.set_ready(kbd_pid);
             crate::syscall::set_keyboard_server_pid(kbd_pid);
+            // Register keyboard server as handler for IRQ 1 (keyboard)
+            crate::interrupt_server::register_handler(1, kbd_pid);
             unsafe {
                 core::ptr::write_volatile(0xB800A as *mut u8, b'K');
                 core::ptr::write_volatile(0xB800B as *mut u8, 0x0A);

@@ -41,17 +41,64 @@
 //! page-table allocation and user-program code pages.
 //!
 //! =============================================================================
-//! FRAME ALLOCATOR
+//! FRAME ALLOCATOR (Bitmap-based with free-list support)
 //! =============================================================================
 //!
-//! Simple bump allocator that hands out 4KB-aligned physical frames from
-//! just past the kernel's BSS section (__kernel_end) upward. This is safe
-//! because:
-//!   - The kernel identity-maps physical 0-16MB (enough for kernel + early allocs)
-//!   - We know QEMU provides at least 128MB (-m 128)
-//!   - No virtual-to-physical offset: physical address = virtual address
+//! We use a bitmap to track all 4KB frames in the physical address range
+//! [PHYS_MEM_START, PHYS_MEM_END). A set bit (1) means the frame is free;
+//! a cleared bit (0) means it is in use. This is Phase 0 of the microkernel
+//! plan: it replaces the old bump allocator so that freed frames can be
+//! reclaimed and reused.
+//!
+//!   Bitmap size: 64 words × 64 bits each = 4096 bits per cache line
+//!   Covers: (PHYS_MEM_END - PHYS_MEM_START) / PAGE_SIZE frames
+//!
+//! Allocation scans the bitmap for the first free frame (lowest address).
+//! Freeing simply sets the corresponding bit back to 1.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+
+// =============================================================================
+// PHYSICAL MEMORY CONSTANTS
+// =============================================================================
+
+/// Physical memory range managed by the bitmap allocator.
+/// 0x100000 (1 MB) to 0x8000000 (128 MB) — QEMU default with -m 128.
+pub const PHYS_MEM_START: u64 = 0x0010_0000;
+pub const PHYS_MEM_END: u64   = 0x0800_0000;
+
+/// Number of 4 KB frames we manage.
+pub const NUM_FRAMES: usize = ((PHYS_MEM_END - PHYS_MEM_START) / 4096) as usize; // 32512
+
+/// Number of 64-bit words in the bitmap.
+pub const BITMAP_WORDS: usize = (NUM_FRAMES + 63) / 64; // 508
+
+/// Frame allocation bitmap: bit = 1 means free, 0 means in use.
+/// Initialised to all-1 (all free); init_frame_allocator() marks kernel pages.
+static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [u64::MAX; BITMAP_WORDS];
+
+/// Convert a physical address to a bitmap frame index.
+fn addr_to_frame_idx(addr: u64) -> usize {
+    ((addr - PHYS_MEM_START) / 4096) as usize
+}
+
+/// Convert a bitmap frame index back to a physical address.
+fn frame_idx_to_addr(idx: usize) -> u64 {
+    PHYS_MEM_START + (idx as u64) * 4096
+}
+
+/// Mark a single frame as in-use (called during init to reserve kernel pages).
+unsafe fn mark_frame_in_use(phys: u64) {
+    if phys < PHYS_MEM_START || phys >= PHYS_MEM_END {
+        return;
+    }
+    let idx = addr_to_frame_idx(phys);
+    let w = idx / 64;
+    let b = idx % 64;
+    if w < BITMAP_WORDS {
+        FRAME_BITMAP[w] &= !(1u64 << b);
+    }
+}
 
 // =============================================================================
 // ADDRESS CONSTANTS
@@ -101,6 +148,11 @@ pub mod page_flags {
     /// Global page: TLB entries survive CR3 writes (only when CR4.PGE=1)
     pub const GLOBAL: u64 = 1 << 8;
     pub const EXECUTABLE_DISABLE: u64 = 1 << 63;
+    /// Copy-on-Write: page is shared between parent and child after fork.
+    /// When either process writes to it, the page fault handler must
+    /// allocate a new frame and copy the data.
+    /// Uses bit 9 (available for OS use in x86-64 PTEs).
+    pub const COW: u64 = 1 << 9;
 }
 
 /// User-accessible page flags (U=1)
@@ -117,36 +169,206 @@ extern "C" {
     static __kernel_end: u8;
 }
 
-static ALLOC_CURSOR: AtomicU64 = AtomicU64::new(0);
-
+/// Initialise the bitmap allocator.
+///
+/// Marks all physical pages from 0 up to `__kernel_end` as in-use
+/// (kernel code/data occupies them). Everything above is marked free.
 pub fn init_frame_allocator() {
     unsafe {
         let kernel_end = &__kernel_end as *const u8 as u64;
-        let start = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        ALLOC_CURSOR.store(start, Ordering::Relaxed);
+        // Mark kernel code/data pages as in-use
+        let mut addr = PHYS_MEM_START;
+        while addr < kernel_end {
+            mark_frame_in_use(addr);
+            addr += 4096;
+        }
     }
 }
 
-/// Allocate a single 4KB physical frame.
+/// Allocate a single 4 KB physical frame.
 ///
-/// Returns the physical address of the frame (identity-mapped, so it's both
-/// the physical and virtual address). The frame is zero-initialized.
+/// Scans the bitmap for the first free frame, marks it in-use,
+/// zeroes it, and returns its physical address.
 ///
-/// # Panics
-///
-/// Panics if the cursor wraps around (exhausted the identity-mapped region).
+/// Returns 0 if no free frames are available (OOM).
 pub fn alloc_frame() -> u64 {
-    let addr = ALLOC_CURSOR.fetch_add(PAGE_SIZE, Ordering::Relaxed);
-    // Zero the frame
     unsafe {
-        core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize);
+        for (word_idx, word) in FRAME_BITMAP.iter_mut().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let frame_idx = word_idx * 64 + bit;
+                if frame_idx < NUM_FRAMES {
+                    // Claim this frame
+                    *word &= !(1u64 << bit);
+                    let addr = frame_idx_to_addr(frame_idx);
+                    // Zero the frame
+                    core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize);
+                    return addr;
+                }
+                // Clear this bit and continue scanning the word
+                bits &= bits - 1;
+            }
+        }
     }
-    addr
+    0 // Out of memory
 }
 
-/// Allocate and zero a 4KB frame, returning the physical address.
+/// Allocate and zero a 4 KB frame, returning the physical address.
 pub fn alloc_zeroed_frame() -> u64 {
     alloc_frame()
+}
+
+// =============================================================================
+// FRAME FREEING (Phase 0 — microkernel memory reclamation)
+// =============================================================================
+
+/// Free a physical frame, returning it to the bitmap pool.
+///
+/// The frame's bit is set to 1 (free).  Subsequent calls to `alloc_frame`
+/// may recycle it.
+pub fn free_frame(phys: u64) {
+    if phys < PHYS_MEM_START || phys >= PHYS_MEM_END {
+        return;
+    }
+    let idx = addr_to_frame_idx(phys);
+    let w = idx / 64;
+    let b = idx % 64;
+    if w >= BITMAP_WORDS {
+        return;
+    }
+    unsafe {
+        FRAME_BITMAP[w] |= 1u64 << b;
+    }
+}
+
+/// Walk a user process's page tables and free every 4-KiB mapped frame.
+///
+/// `pml4_phys` — physical address of the process's PML4.
+/// `vaddr`     — starting virtual address (must be page-aligned).
+/// `len`       — number of bytes to unmap (rounded up to PAGE_SIZE).
+///
+/// This only touches leaf PTEs; intermediate table frames (PML4, PDPT, PD,
+/// PT) are NOT freed here — use `free_page_table_tree` for that.
+///
+/// # Safety
+///
+/// `pml4_phys` must be the physical address of a valid PML4. The kernel
+/// must not have any live references into the unmapped range.
+pub unsafe fn munmap_range(pml4_phys: u64, vaddr: u64, len: u64) {
+    let end = vaddr.saturating_add((len + 4095) & !4095);
+    let mut va = vaddr & !4095; // page-align start
+
+    while va < end && va < USER_VADDR_END {
+        let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((va >> 21) & 0x1FF) as usize;
+        let pt_idx   = ((va >> 12) & 0x1FF) as usize;
+
+        // Read PML4E
+        let pml4e = read_pt_entry(pml4_phys, pml4_idx);
+        if pml4e & page_flags::PRESENT == 0 {
+            va += 1 << 39; // Skip whole 512 GB region
+            continue;
+        }
+        let pdpt = pml4e & 0x000FFFFFFFFFF000;
+
+        // Check for 1 GB huge page
+        let pdpte = read_pt_entry(pdpt, pdpt_idx);
+        if pdpte & page_flags::PRESENT == 0 {
+            va += 1 << 30; // Skip whole 1 GB region
+            continue;
+        }
+        if pdpte & page_flags::LARGE != 0 {
+            // 1 GB huge page — free the 2 MiB-aligned chunks inside
+            // (For simplicity, skip huge pages in munmap for now.)
+            va += 1 << 30;
+            continue;
+        }
+        let pd = pdpte & 0x000FFFFFFFFFF000;
+
+        // Check for 2 MB huge page
+        let pde = read_pt_entry(pd, pd_idx);
+        if pde & page_flags::PRESENT == 0 {
+            va += 1 << 21; // Skip whole 2 MB region
+            continue;
+        }
+        if pde & page_flags::LARGE != 0 {
+            // 2 MB huge page
+            let base = pde & 0x000FFFFFFFFFF000;
+            for i in 0..512 {
+                let frame = base + (i as u64) * 4096;
+                free_frame(frame);
+            }
+            // Clear the PDE
+            write_pt_entry(pd, pd_idx, 0);
+            va += 1 << 21;
+            continue;
+        }
+        let pt = pde & 0x000FFFFFFFFFF000;
+
+        // Free the 4 KB page if present
+        let pte = read_pt_entry(pt, pt_idx);
+        if pte & page_flags::PRESENT != 0 {
+            let frame = pte & 0x000FFFFFFFFFF000;
+            free_frame(frame);
+            write_pt_entry(pt, pt_idx, 0);
+        }
+        va += 4096;
+    }
+}
+
+/// Free all page-table frames (PML4, PDPT, PD, PT) for a process.
+///
+/// Walks the full 4-level tree and frees every frame that belongs to the
+/// page-table hierarchy.  Does NOT free leaf mapped frames (those are
+/// handled by `munmap_range`).
+///
+/// # Safety
+///
+/// The caller must ensure the process is no longer scheduled and that no
+/// other CPU core is using these page tables.
+pub unsafe fn free_page_table_tree(pml4_phys: u64) {
+    // Walk PML4 entries
+    for pml4_idx in 0..PT_ENTRIES {
+        let pml4e = read_pt_entry(pml4_phys, pml4_idx);
+        if pml4e & page_flags::PRESENT == 0 {
+            continue;
+        }
+        let pdpt_base = pml4e & 0x000FFFFFFFFFF000;
+
+        // Walk PDPT entries
+        for pdpt_idx in 0..PT_ENTRIES {
+            let pdpte = read_pt_entry(pdpt_base, pdpt_idx);
+            if pdpte & page_flags::PRESENT == 0 {
+                continue;
+            }
+            if pdpte & page_flags::LARGE != 0 {
+                continue; // 1 GB huge page — skip
+            }
+            let pd_base = pdpte & 0x000FFFFFFFFFF000;
+
+            // Walk PD entries
+            for pd_idx in 0..PT_ENTRIES {
+                let pde = read_pt_entry(pd_base, pd_idx);
+                if pde & page_flags::PRESENT == 0 {
+                    continue;
+                }
+                if pde & page_flags::LARGE != 0 {
+                    continue; // 2 MB huge page — skip
+                }
+                // Free the PT frame
+                let pt_base = pde & 0x000FFFFFFFFFF000;
+                free_frame(pt_base);
+            }
+            // Free the PD frame
+            free_frame(pd_base);
+        }
+        // Free the PDPT frame
+        free_frame(pdpt_base);
+    }
+    // Free the PML4 frame itself
+    free_frame(pml4_phys);
 }
 
 // =============================================================================
@@ -173,6 +395,156 @@ pub unsafe fn read_pt_entry(table_phys: u64, index: usize) -> u64 {
 /// Zero an entire page-table frame (set all 512 entries to 0).
 pub unsafe fn zero_pt_frame(table_phys: u64) {
     core::ptr::write_bytes(table_phys as *mut u8, 0, 4096);
+}
+
+// =============================================================================
+// COPY-ON-WRITE (Phase 2 — Process Creation)
+// =============================================================================
+
+/// Copy a page table tree for fork with Copy-on-Write.
+///
+/// Walks the 4-level page table rooted at `src_pml4`, creates a new
+/// parallel tree, and maps every user-accessible leaf page with the COW
+/// flag set and WRITABLE cleared.  Both parent and child share the same
+/// physical frames until one of them writes.
+///
+/// Returns the physical address of the new PML4.
+///
+/// # Safety
+///
+/// `src_pml4` must be a valid PML4 physical address.
+pub unsafe fn copy_page_table_cow(src_pml4: u64) -> u64 {
+    let dst_pml4 = alloc_zeroed_frame();
+
+    for pml4_idx in 0..PT_ENTRIES {
+        let src_pml4e = read_pt_entry(src_pml4, pml4_idx);
+        if src_pml4e & page_flags::PRESENT == 0 {
+            continue;
+        }
+
+        let src_pdpt = src_pml4e & 0x000FFFFFFFFFF000;
+        let dst_pdpt = alloc_zeroed_frame();
+
+        // Link the new PDPT into the new PML4 with the same flags
+        let iflags = src_pml4e & (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS);
+        write_pt_entry(dst_pml4, pml4_idx, (dst_pdpt & 0x000FFFFFFFFFF000) | iflags);
+
+        for pdpt_idx in 0..PT_ENTRIES {
+            let src_pdpte = read_pt_entry(src_pdpt, pdpt_idx);
+            if src_pdpte & page_flags::PRESENT == 0 {
+                continue;
+            }
+
+            if src_pdpte & page_flags::LARGE != 0 {
+                // 1 GB huge page — copy the PDE as-is but mark COW
+                let cow_pdpte = (src_pdpte & !page_flags::WRITABLE) | page_flags::COW;
+                write_pt_entry(dst_pdpt, pdpt_idx, cow_pdpte);
+                continue;
+            }
+
+            let src_pd = src_pdpte & 0x000FFFFFFFFFF000;
+            let dst_pd = alloc_zeroed_frame();
+            let iflags = src_pdpte & (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS);
+            write_pt_entry(dst_pdpt, pdpt_idx, (dst_pd & 0x000FFFFFFFFFF000) | iflags);
+
+            for pd_idx in 0..PT_ENTRIES {
+                let src_pde = read_pt_entry(src_pd, pd_idx);
+                if src_pde & page_flags::PRESENT == 0 {
+                    continue;
+                }
+
+                if src_pde & page_flags::LARGE != 0 {
+                    // 2 MB huge page — mark COW
+                    let cow_pde = (src_pde & !page_flags::WRITABLE) | page_flags::COW;
+                    write_pt_entry(dst_pd, pd_idx, cow_pde);
+                    continue;
+                }
+
+                let src_pt = src_pde & 0x000FFFFFFFFFF000;
+                let dst_pt = alloc_zeroed_frame();
+                let iflags = src_pde & (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS);
+                write_pt_entry(dst_pd, pd_idx, (dst_pt & 0x000FFFFFFFFFF000) | iflags);
+
+                for pt_idx in 0..PT_ENTRIES {
+                    let src_pte = read_pt_entry(src_pt, pt_idx);
+                    if src_pte & page_flags::PRESENT == 0 {
+                        continue;
+                    }
+                    // Only user pages get COW; kernel pages are shared as-is
+                    if src_pte & page_flags::USER_ACCESS == 0 {
+                        write_pt_entry(dst_pt, pt_idx, src_pte);
+                        continue;
+                    }
+                    // Mark as read-only + COW in the *new* page table
+                    let cow_pte = (src_pte & !page_flags::WRITABLE) | page_flags::COW;
+                    write_pt_entry(dst_pt, pt_idx, cow_pte);
+                }
+            }
+        }
+    }
+    dst_pml4
+}
+
+/// Handle a page fault caused by a write to a Copy-on-Write page.
+///
+/// Called from the page-fault handler (#PF, vector 0x0E) when:
+///   - The faulting address is in user space
+///   - The page is present but marked COW / read-only
+///
+/// Allocates a new physical frame, copies the data from the shared frame,
+/// updates the PTE to be writable (removing COW), and flushes the TLB.
+///
+/// # Safety
+///
+/// `cr3` must be the current process's PML4 physical address.
+pub unsafe fn handle_cow_fault(cr3: u64, fault_addr: u64) -> bool {
+    // Walk the page tables to find the leaf PTE
+    let pml4_idx = ((fault_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((fault_addr >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((fault_addr >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((fault_addr >> 12) & 0x1FF) as usize;
+
+    let pml4e = read_pt_entry(cr3, pml4_idx);
+    if pml4e & page_flags::PRESENT == 0 { return false; }
+    let pdpt = pml4e & 0x000FFFFFFFFFF000;
+
+    let pdpte = read_pt_entry(pdpt, pdpt_idx);
+    if pdpte & page_flags::PRESENT == 0 { return false; }
+    if pdpte & page_flags::LARGE != 0 { return false; } // Skip 1G pages
+    let pd = pdpte & 0x000FFFFFFFFFF000;
+
+    let pde = read_pt_entry(pd, pd_idx);
+    if pde & page_flags::PRESENT == 0 { return false; }
+    if pde & page_flags::LARGE != 0 { return false; } // Skip 2M pages
+    let pt = pde & 0x000FFFFFFFFFF000;
+
+    let pte = read_pt_entry(pt, pt_idx);
+    if pte & page_flags::PRESENT == 0 { return false; }
+    if pte & page_flags::COW == 0 { return false; } // Not a COW page
+
+    // Allocate a new frame and copy the data
+    let old_phys = pte & 0x000FFFFFFFFFF000;
+    let new_frame = alloc_frame();
+    if new_frame == 0 { return false; } // OOM
+
+    // Copy 4 KB from old frame to new frame
+    core::ptr::copy_nonoverlapping(
+        old_phys as *const u8,
+        new_frame as *mut u8,
+        4096,
+    );
+
+    // Update the PTE: new phys addr, writable, no COW
+    let new_pte = (new_frame & 0x000FFFFFFFFFF000)
+        | (pte & (page_flags::PRESENT | page_flags::USER_ACCESS | page_flags::GLOBAL
+                  | page_flags::CACHE_DISABLE | page_flags::WRITE_THROUGH))
+        | page_flags::WRITABLE;
+    write_pt_entry(pt, pt_idx, new_pte);
+
+    // Flush the TLB for this single page
+    core::arch::asm!("invlpg [{}]", in(reg) fault_addr, options(nostack));
+
+    true
 }
 
 // =============================================================================

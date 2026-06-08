@@ -1,6 +1,11 @@
 # OS Kernel Concepts
 
-This document explains the core low-level concepts exercised by this repository's current kernel path: **PVH boot + long-mode bootstrap + VGA/PS2 interaction**.
+> **Note**: This document describes an early version of the kernel (polling
+> keyboard, no IPC, no multitasking). For the current architecture with
+> preemptive scheduling, IPC, fork/exec, ELF loading, filesystem, capabilities,
+> and signals, see [architecture.md](./architecture.md) and the [README](../README.md).
+
+This document explains the core low-level concepts exercised by this repository's kernel path: **PVH boot + long-mode bootstrap + VGA/PS2 interaction**.
 
 ## 1) `no_std` Kernel Model
 

@@ -51,7 +51,7 @@ use crate::vga;
 static mut VGA_SERVER_PID: u16 = 0;
 
 /// PID of the user-space keyboard input server (0 = not yet spawned).
-static mut KEYBOARD_SERVER_PID: u16 = 0;
+pub static mut KEYBOARD_SERVER_PID: u16 = 0;
 
 /// Set the PID of the VGA server (called during boot after spawning it).
 pub fn set_vga_server_pid(pid: u16) {
@@ -77,6 +77,21 @@ pub mod syscall_nr {
     /// Get a well-known server PID by type:
     ///   1 = VGA server, 2 = keyboard server
     pub const GET_SERVER_PID: usize = 10;
+    // Phase 2 — Process creation
+    pub const FORK: usize = 13;
+    pub const EXEC: usize = 14;
+    // Phase 4 — Hardening
+    pub const REGISTER_IRQ: usize = 15;
+    pub const CAP_SEND: usize = 16;
+    pub const REGISTER_SIGNAL: usize = 17;
+    pub const WAIT_SIGNAL: usize = 18;
+    // Phase 3 — ELF loader
+    pub const EXEC_ELF: usize = 19;
+    // Phase 3 — File system
+    pub const OPEN: usize = 20;
+    pub const FS_READ: usize = 21;
+    pub const CLOSE: usize = 22;
+    pub const READDIR: usize = 23;
 }
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
@@ -84,18 +99,18 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> isize;
 
 pub struct SyscallTable {
-    handlers: [Option<SyscallHandler>; 16],
+    handlers: [Option<SyscallHandler>; 32],
 }
 
 impl SyscallTable {
     pub const fn new() -> Self {
         Self {
-            handlers: [None; 16],
+            handlers: [None; 32],
         }
     }
 
     pub fn register(&mut self, nr: usize, handler: SyscallHandler) {
-        if nr < 16 {
+        if nr < 32 {
             self.handlers[nr] = Some(handler);
         }
     }
@@ -126,6 +141,21 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::IPC_SEND] = Some(sys_ipc_send);
     table.handlers[syscall_nr::IPC_RECV] = Some(sys_ipc_recv);
     table.handlers[syscall_nr::GET_SERVER_PID] = Some(sys_get_server_pid);
+    // Phase 2 — Process creation
+    table.handlers[syscall_nr::FORK] = Some(sys_fork);
+    table.handlers[syscall_nr::EXEC] = Some(sys_exec);
+    // Phase 4 — System hardening
+    table.handlers[syscall_nr::REGISTER_IRQ] = Some(sys_register_irq);
+    table.handlers[syscall_nr::CAP_SEND] = Some(sys_cap_send);
+    table.handlers[syscall_nr::REGISTER_SIGNAL] = Some(sys_register_signal);
+    table.handlers[syscall_nr::WAIT_SIGNAL] = Some(sys_wait_signal);
+    // Phase 3 — ELF loader
+    table.handlers[syscall_nr::EXEC_ELF] = Some(sys_exec_elf);
+    // Phase 3 — File system
+    table.handlers[syscall_nr::OPEN] = Some(sys_open);
+    table.handlers[syscall_nr::FS_READ] = Some(sys_fs_read);
+    table.handlers[syscall_nr::CLOSE] = Some(sys_close);
+    table.handlers[syscall_nr::READDIR] = Some(sys_readdir);
     table
 };
 
@@ -238,6 +268,20 @@ fn sys_ipc_send(dst_pid: usize, msg_ptr: usize, _a3: usize, _a4: usize, _a5: usi
     }
 
     let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+
+    // Phase 4 — Capability enforcement: the sender must hold a capability
+    // for the destination PID's endpoint type.
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(sender) = (*pt).get_mut(current) {
+            if !crate::capability::check_ipc_send(sender.capabilities, dst_pid as u16) {
+                return -1; // No capability — rejected
+            }
+        }
+    }
 
     unsafe {
         let pt = &raw mut process::PROCESS_TABLE;
@@ -296,6 +340,340 @@ fn sys_ipc_recv(buf_ptr: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, 
 }
 
 // =============================================================================
+// PHASE 2 — PROCESS CREATION SYSCALLS
+// =============================================================================
+
+/// FORK: Create a child process as a copy of the current one.
+///
+/// Returns the child's PID on success, or -1 on failure (table full).
+fn sys_fork(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1; // kernel can't fork
+    }
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        match (*pt).fork_process(current) {
+            Some(child_pid) => {
+                crate::vga::serial_print("fork: pid->");
+                child_pid as isize
+            }
+            None => -1,
+        }
+    }
+}
+
+/// EXEC: Replace the current process image with an ELF binary loaded
+/// from the embedded filesystem.
+///
+/// a1 = path string pointer (user-space, null-terminated)
+/// a2 = maximum path length to read (bytes)
+///
+/// Returns 0 on success, -1 on error.
+fn sys_exec(path_ptr: usize, path_max: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 || path_ptr == 0 || path_max == 0 {
+        return -1;
+    }
+
+    // Copy path from user space (up to 63 chars)
+    let max_len = path_max.min(63);
+    let mut path_buf = [0u8; 64];
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), max_len);
+    }
+    // Ensure null termination
+    path_buf[max_len] = 0;
+
+    let len = path_buf.iter().position(|&c| c == 0).unwrap_or(max_len);
+    if len == 0 {
+        return -1;
+    }
+    let path_str = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
+
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if (*pt).load_elf_into_process(current, path_str) {
+            crate::vga::serial_print("exec: pid -> ");
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+// =============================================================================
+// PHASE 3 — ELF LOADER SYSCALL
+// =============================================================================
+
+/// EXEC_ELF: Load an ELF binary from memory into the current process.
+///
+/// a1 = pointer to ELF data in user space
+/// a2 = size of ELF data in bytes
+///
+/// Returns 0 on success, -1 on failure.
+fn sys_exec_elf(data_ptr: usize, data_size: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    if data_ptr == 0 || data_size < 64 {
+        return -1;
+    }
+    // Validate user pointer
+    if !is_valid_user_ptr(data_ptr) {
+        return -1;
+    }
+
+    unsafe {
+        // Read ELF data from user space into a kernel buffer (up to 64 KiB)
+        let max_size = data_size.min(65536);
+        let mut elf_buf: core::mem::MaybeUninit<[u8; 65536]> = core::mem::MaybeUninit::uninit();
+        let buf_ptr = elf_buf.as_mut_ptr() as *mut u8;
+        core::ptr::copy_nonoverlapping(data_ptr as *const u8, buf_ptr, max_size);
+        let elf_data = core::slice::from_raw_parts(buf_ptr, max_size);
+
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(proc) = (*pt).get_mut(current) {
+            // Use the ELF loader to map segments into the process's page table
+            match crate::elf::load_elf(elf_data, proc.cr3) {
+                Ok(result) => {
+                    // Reset registers and set entry point
+                    proc.entry_point = result.entry;
+                    proc.registers = process::ProcessRegisters::default();
+                    proc.registers.rsp = result.stack_top;
+                    proc.registers.rip = result.entry;
+                    crate::vga::serial_print("exec_elf: ok\n");
+                    0
+                }
+                Err(_e) => {
+                    crate::vga::serial_print("exec_elf: err\n");
+                    -1
+                }
+            }
+        } else {
+            -1
+        }
+    }
+}
+
+// =============================================================================
+// PHASE 3 — FILE SYSTEM SYSCALLS
+// =============================================================================
+
+/// OPEN: Open a file by name.
+///
+/// a1 = pointer to filename string in user space
+/// a2 = max filename length to read
+///
+/// Returns a file descriptor (>= 0) on success, or -1 on error.
+fn sys_open(name_ptr: usize, name_max: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 || !is_valid_user_ptr(name_ptr) || name_max == 0 {
+        return -1;
+    }
+
+    // Copy filename from user space
+    let max_len = name_max.min(31);
+    let mut name_buf = [0u8; 32];
+    unsafe {
+        core::ptr::copy_nonoverlapping(name_ptr as *const u8, name_buf.as_mut_ptr(), max_len);
+    }
+    // Null-terminate
+    name_buf[max_len] = 0;
+
+    // Find null terminator and create str
+    let len = name_buf.iter().position(|&c| c == 0).unwrap_or(max_len);
+    if len == 0 {
+        return -1;
+    }
+    let name = core::str::from_utf8(&name_buf[..len]).unwrap_or("");
+
+    match crate::filesystem::open(current, name) {
+        Some(fd) => fd as isize,
+        None => -1,
+    }
+}
+
+/// FS_READ: Read from an open file descriptor.
+///
+/// a1 = file descriptor
+/// a2 = pointer to user-space buffer
+/// a3 = number of bytes to read
+///
+/// Returns bytes read, or -1 on error.
+fn sys_fs_read(fd: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 || !is_valid_user_ptr(buf_ptr) || count == 0 {
+        return -1;
+    }
+
+    let max_count = count.min(4096); // Safety limit
+    let mut kernel_buf = [0u8; 4096];
+
+    match crate::filesystem::read(current, fd, &mut kernel_buf[..max_count]) {
+        Some(bytes_read) => {
+            if bytes_read > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        kernel_buf.as_ptr(),
+                        buf_ptr as *mut u8,
+                        bytes_read,
+                    );
+                }
+            }
+            bytes_read as isize
+        }
+        None => -1,
+    }
+}
+
+/// CLOSE: Close an open file descriptor.
+///
+/// a1 = file descriptor
+///
+/// Returns 0 on success, -1 on error.
+fn sys_close(fd: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    if crate::filesystem::close(current, fd) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// READDIR: List files in the directory.
+///
+/// a1 = pointer to user-space buffer for file names
+/// a2 = buffer size
+///
+/// Returns number of bytes written, or -1 on error.
+fn sys_readdir(buf_ptr: usize, buf_size: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if !is_valid_user_ptr(buf_ptr) || buf_size == 0 {
+        return -1;
+    }
+
+    let max_size = buf_size.min(4096);
+    let mut kernel_buf = [0u8; 4096];
+
+    let written = crate::filesystem::list(&mut kernel_buf[..max_size]);
+    if written > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, written);
+        }
+    }
+    written as isize
+}
+
+// =============================================================================
+// PHASE 4 — SYSTEM HARDENING SYSCALLS
+// =============================================================================
+
+/// REGISTER_IRQ: Register a user-space IRQ handler.
+///
+/// a1 = IRQ vector number (e.g. 0x21 for keyboard)
+/// a2 = handler PID (-1 = self)
+fn sys_register_irq(vector: usize, handler_pid: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if vector >= 256 {
+        return -1;
+    }
+    let pid = if handler_pid == !0usize {
+        process::get_current_pid()
+    } else {
+        handler_pid as u16
+    };
+    // Register with interrupt server
+    unsafe {
+        crate::interrupt_server::register_handler(vector as u8, pid);
+    }
+    crate::vga::serial_print("IRQ registered\n");
+    0
+}
+
+/// CAP_SEND: Check capability before sending an IPC message.
+///
+/// a1 = destination PID
+/// Returns 0 if the current process has the capability to send to that PID,
+/// -1 otherwise.
+fn sys_cap_send(dst_pid: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(current) {
+            if crate::capability::check_ipc_send(p.capabilities, dst_pid as u16) {
+                return 0;
+            }
+        }
+    }
+    -1
+}
+
+/// REGISTER_SIGNAL: Register a signal handler function.
+///
+/// a1 = signal number (0-63)
+/// a2 = handler address (0 = reset to default / ignore)
+fn sys_register_signal(sig: usize, handler: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if sig >= 64 {
+        return -1;
+    }
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(current) {
+            if handler == 0 {
+                p.signal_handlers[sig] = None;
+            } else {
+                p.signal_handlers[sig] = Some(handler as u64);
+            }
+            return 0;
+        }
+    }
+    -1
+}
+
+/// WAIT_SIGNAL: Block the process until a signal arrives (or poll).
+///
+/// a1 = timeout in ticks (0 = poll, returns immediately)
+/// Returns the signal number on success, or -1 if no signals pending.
+fn sys_wait_signal(timeout: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    // For now, simple poll — check pending signals
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if let Some(p) = (*pt).get_mut(current) {
+            if p.signal_pending != 0 {
+                // Find and return the first pending signal
+                let sig = p.signal_pending.trailing_zeros() as usize;
+                p.signal_pending &= !(1u64 << sig);
+                return sig as isize;
+            }
+            // If timeout == 0 (poll), return immediately
+            if timeout == 0 {
+                return -1;
+            }
+            // Otherwise block and wait (simplified: just yield and retry)
+            p.state = process::ProcessState::Blocked;
+        }
+    }
+    // Yield and let scheduler pick another process
+    process::schedule_next();
+    // When we wake up, check again
+    -1
+}
+
+// =============================================================================
 // SYSCALL DISPATCH (called from assembly entry)
 // =============================================================================
 
@@ -313,7 +691,7 @@ pub unsafe extern "C" fn syscall_dispatch(
     a4: usize,
     a5: usize,
 ) -> isize {
-    if nr < 16 {
+    if nr < 32 {
         let handler = SYSCALL_TABLE.handlers[nr];
         if let Some(h) = handler {
             return h(a1, a2, a3, a4, a5, nr);
@@ -722,15 +1100,18 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
             *frame.add(15) = p.registers.rip;
             *frame.add(17) = p.registers.rflags;
 
-            // === 5. Switch to next process's address space ===
+            // === 5. Deliver pending signals to the next process ===
+            crate::signal::deliver_pending(next);
+
+            // === 7. Switch to next process's address space ===
             // Write CR3 with the next process's PML4 physical address.
             // This TLB-flushes all non-global entries automatically.
             core::arch::asm!("mov cr3, {}", in(reg) p.cr3, options(nostack));
 
-            // === 6. Update TSS.RSP0 so interrupts use this process's kernel stack ===
+            // === 8. Update TSS.RSP0 so interrupts use this process's kernel stack ===
             crate::tss::TSS.set_rsp0(p.kernel_stack_top);
 
-            // === 7. Update syscall kernel stack (syscall doesn't use TSS.RSP0) ===
+            // === 9. Update syscall kernel stack (syscall doesn't use TSS.RSP0) ===
             crate::tss::CURRENT_KERNEL_RSP = p.kernel_stack_top;
 
             p.state = ProcessState::Running;
@@ -784,22 +1165,14 @@ pub unsafe extern "C" fn keyboard_irq_handler() {
     let scancode: u8;
     core::arch::asm!("in al, 0x60", out("al") scancode, options(nostack));
 
-    // ── Step 2: Forward raw scancode to keyboard server via IPC ──
-    // We push an IPC message (type 3 = MSG_KEY_SCANCODE) directly into
-    // the keyboard server's kernel-side queue. No syscall needed — we're
-    // already in kernel mode. This is an "in-kernel IPC" optimization:
-    // the sender (IRQ handler) writes directly to the receiver's queue.
-    let kb_pid = KEYBOARD_SERVER_PID;
-    if kb_pid != 0 {
-        let msg = process::IpcMessage::new(0, 3 /* MSG_KEY_SCANCODE */, {
-            let mut d = [0u8; 60];
-            d[0] = scancode;
-            d
-        });
-        let pt = &raw mut process::PROCESS_TABLE;
-        if let Some(p) = (*pt).get_mut(kb_pid) {
-            let _ = p.ipc_push(msg);
-        }
+    // ── Step 2: Forward raw scancode through interrupt server ──
+    // Instead of pushing directly to the keyboard server, we go through
+    // the interrupt server (or its backward-compatible fallback).
+    // This enables the true microkernel IRQ routing path.
+    {
+        let mut data = [0u8; 60];
+        data[0] = scancode;
+        crate::interrupt_server::forward_irq(1 /* keyboard IRQ */, &data);
     }
 
     // ── Step 3: Send End-Of-Interrupt to the master PIC ──
