@@ -94,8 +94,15 @@ pub mod syscall_nr {
     pub const READDIR: usize = 23;
 }
 
+/// The legacy INT 0x80 vector is defined here for reference.
+/// All actual syscalls use the faster x86-64 SYSCALL instruction (STAR/LSTAR MSRs).
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
+/// Syscall handler function pointer type.
+///
+/// Signature: `(a1, a2, a3, a4, a5, nr) -> isize`.
+/// The first five parameters are the argument registers (rdi, rsi, rdx, r10, r8).
+/// The last parameter is the syscall number itself.
 pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> isize;
 
 pub struct SyscallTable {
@@ -109,12 +116,25 @@ impl SyscallTable {
         }
     }
 
+    /// Register a handler for the given syscall number.
+    ///
+    /// If `nr >= 32` the registration is silently ignored (the table has
+    /// only 32 slots, matching the x86-64 SYSCALL convention which uses a
+    /// fast dispatch path through MSRs).
     pub fn register(&mut self, nr: usize, handler: SyscallHandler) {
         if nr < 32 {
             self.handlers[nr] = Some(handler);
         }
     }
 
+    /// Dispatch a syscall.
+    ///
+    /// Looks up the handler for `nr` and invokes it with the five argument
+    /// registers plus the syscall number itself (convention: the last
+    /// parameter of each handler receives `nr`, matching the assembly entry
+    /// point which pushes the syscall number before calling into Rust).
+    ///
+    /// Returns `-1` if no handler is registered for that number.
     pub fn handle(
         &self,
         nr: usize,
@@ -159,6 +179,12 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table
 };
 
+/// Handles the `WRITE` syscall.
+///
+/// Writes `count` bytes from the buffer at address `buf` to the
+/// specified file descriptor. Only stdout (1) and stderr (2)
+/// are supported. Returns the number of bytes written on success,
+/// or `-1` on failure.
 fn sys_write(fd: usize, buf: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     if (fd == 1 || fd == 2) && buf >= 0x400000 && buf < 0x800000000 {
         let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
@@ -171,10 +197,18 @@ fn sys_write(fd: usize, buf: usize, count: usize, _a4: usize, _a5: usize, _nr: u
     }
 }
 
+/// EXIT: Terminate the calling process and halt the system.
+///
+/// In this educational OS, there is no user-level cleanup — exiting simply
+/// enters an infinite loop (a real kernel would free resources and reboot).
 fn sys_exit(_code: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     loop {}
 }
 
+/// VGA_WRITE: Send a single ASCII byte to the VGA display server for rendering.
+///
+/// `a1` = ASCII code of the character to write. If the VGA server is not yet
+/// running (early boot / panic path), falls back to direct kernel-side VGA output.
 fn sys_vga_write(byte: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     let vga_pid = unsafe { VGA_SERVER_PID };
     if vga_pid == 0 {
@@ -199,6 +233,9 @@ fn sys_vga_write(byte: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _n
     -1
 }
 
+/// VGA_CLEAR: Clear the screen via the VGA display server.
+///
+/// If the VGA server is not yet running, falls back to kernel-side `vga::clear_screen()`.
 fn sys_vga_clear(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     let vga_pid = unsafe { VGA_SERVER_PID };
     if vga_pid == 0 {
@@ -218,6 +255,11 @@ fn sys_vga_clear(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr
     -1
 }
 
+/// SCHED_YIELD: Cooperative scheduling — yield the CPU to another ready process.
+///
+/// The current process is moved back to the ready queue and `schedule_next()`
+/// selects the next runnable process via round-robin. This only yields when
+/// interrupts are enabled; preemptive scheduling happens through the timer IRQ.
 fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     // Cooperative yield — only works when interrupts are enabled.
     // The timer handler handles preemptive scheduling.
@@ -225,10 +267,16 @@ fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr:
     0
 }
 
+/// GETPID: Return the PID of the calling process.
 fn sys_getpid(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     process::get_current_pid() as isize
 }
 
+/// GET_SERVER_PID: Return the PID of a well-known server process.
+///
+/// `server` selects which server to look up:
+///   1 = VGA display server (PID 1 by convention)
+///   2 = Keyboard input server (PID 0 by default, set via keyboard_irq_init)
 fn sys_get_server_pid(server: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     match server {
         1 => unsafe { VGA_SERVER_PID as isize },

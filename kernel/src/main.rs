@@ -336,7 +336,7 @@ pub extern "C" fn _start() -> ! {
     // STEP 3: CREATE PROCESSES
     // ============================================================================
     unsafe {
-        let pt = &mut *(&raw mut PROCESS_TABLE as *mut process::ProcessTable);
+        let pt = &raw mut PROCESS_TABLE;
 
         // --- Spawn VGA server (PID 1) before any client processes ---
         let vga_entry = crate::user_program::vga_server::vga_main as u64;

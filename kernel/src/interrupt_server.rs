@@ -15,17 +15,18 @@
 
 use crate::process::{IpcMessage, PROCESS_TABLE};
 
-/// Base IRQs (0-3): Timer, Keyboard, RTC, Serial
+/// Number of hardware IRQs managed by this table (IRQ 0–3: Timer, Keyboard, RTC, Serial).
 const BASE_IRQ_COUNT: usize = 4;
 
-/// Maximum number of handler slots per IRQ.
+/// Maximum number of handler processes that can be registered per IRQ.
 const HANDLERS_PER_IRQ: usize = 4;
 
-/// IRQ handler table: for each IRQ, up to HANDLERS_PER_IRQ handler PIDs.
+/// Per-IRQ handler PID table — for each IRQ (indexed 0–3), holds up to `HANDLERS_PER_IRQ` PIDs.
+/// A zero entry means the slot is free.
 static mut IRQ_HANDLERS: [[u16; HANDLERS_PER_IRQ]; BASE_IRQ_COUNT] =
     [[0; HANDLERS_PER_IRQ]; BASE_IRQ_COUNT];
 
-/// PID of the user-space interrupt server process (0 = not yet registered).
+/// PID of the user-space interrupt server process (0 means not yet registered).
 static mut INTERRUPT_SERVER_PID: u16 = 0;
 
 // =============================================================================
@@ -153,7 +154,12 @@ pub fn forward_irq(irq: u8, data: &[u8; 60]) {
     }
 }
 
-/// Simplified scancode translation (used by the interrupt server loop).
+/// Translate a PC scancode (0–57) to an ASCII character.
+///
+/// Covers the primary QWERTY row of the keyboard. Scancodes outside this
+/// range fall back to `'?'`. This is intentionally minimal — only used by
+/// the interrupt-server loop for quick echo; full decoding should happen in
+/// the user-space keyboard server.
 fn translate_scancode(scancode: u8) -> u8 {
     // QWERTY row 1
     const SC2ASCII: &[u8] = b"1234567890-=\x08\tqwertyuiop[]\nasdfghjkl;'`\\zxcvbnm,./ ";
