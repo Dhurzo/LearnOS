@@ -102,4 +102,15 @@ Echo: <line>
 - VGA output requires the QEMU graphical window (`run.sh` defaults to GUI mode).
 - In `-nographic`, VGA memory writes are not visible on terminal.
 - Keyboard input is polling-based (no IRQ/IDT yet), intentionally simple for early kernel bring-up.
-- There is a brach called microkernel with a minimal microkernel approach with the same educational purposes
+
+## 🌿 Alternative: Microkernel Branch
+
+The **`mikrokernel`** branch contains a more advanced educational microkernel that follows the true microkernel philosophy more strictly:
+
+- **Minimal kernel** — only scheduling, virtual memory, IPC, and interrupt forwarding in ring 0
+- **True user-space drivers** — keyboard, VGA, filesystem run as unprivileged user-space processes
+- **Capability-based security** — all IPC requires explicit capabilities; no ambient authority
+- **Message-passing only** — no shared memory between processes except explicitly mapped pages
+- **No built-in drivers** — all hardware interaction happens in user-space servers
+
+This branch demonstrates a "purer" microkernel approach with multiple phases (scheduler, VM, IPC, user-space servers, filesystem, capabilities, signals), while the `master` branch focuses on a simpler monolithic-style kernel for early bring-up education.
