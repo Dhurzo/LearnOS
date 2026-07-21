@@ -271,3 +271,15 @@ Or use the wrapper:
 - [Rust OSDev](https://github.com/rust-osdev/rust-osdev.github.io)
 - [Intel SDM Volume 3](https://software.intel.com/en-us/articles/intel-sdm)
 - [The L4 Microkernel Family](https://en.wikipedia.org/wiki/L4_microkernel_family)
+
+## Alternative: Pure Microkernel Branch
+
+The **`mikrokernel`** branch contains a cleaner, more minimal microkernel implementation that follows the true microkernel philosophy more strictly:
+
+- **Even smaller kernel** — only scheduling, virtual memory, IPC, and interrupt forwarding in ring 0
+- **True user-space drivers** — keyboard, VGA, and filesystem run as completely unprivileged user-space processes
+- **Pure capability-based security** — all IPC requires explicit capabilities; no ambient authority
+- **Message-passing only** — no shared memory between processes except explicitly mapped shared pages
+- **No built-in drivers** — VGA, keyboard, filesystem all run as user-space servers
+
+This branch demonstrates a "purer" microkernel approach, while the `master` branch prioritizes educational clarity with some pragmatic compromises (in-kernel keyboard scancode read, embedded filesystem, etc.).
