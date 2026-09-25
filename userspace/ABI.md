@@ -1,108 +1,73 @@
 # Userspace ABI
 
 Contract between a standalone `userspace` ELF and the LearnOS microkernel.
-Later phases must stay consistent with this file — it is the single source of
-truth for how user programs are loaded, entered, and talk to the kernel.
+The kernel provides mechanisms (address spaces, syscalls, IPC, capabilities,
+interrupt/resource grants); service policy and device protocols live in user
+processes.
 
-## Image format
+## ELF images and address-space layout
 
-| Property        | Value                                   |
-|-----------------|-----------------------------------------|
-| ELF class       | ELF-64, little-endian                   |
-| `e_type`        | `ET_EXEC` (2) — **not** PIE/`DYN`        |
-| Machine         | x86-64                                  |
-| Load base (VMA) | `0x400000`                              |
-| Entry symbol    | `_start`                                |
-| Linking         | static; no dynamic linker, no PT_INTERP |
+| Property | Value |
+|---|---|
+| ELF class | ELF-64, little-endian, x86-64 |
+| `e_type` | `ET_EXEC` (2), not PIE/`DYN` |
+| User ELF window | `[0x10000000, 0x20000000)` |
+| User stack | private 64 KiB ending at `0x00007FFFFFFFF000` |
+| VGA alias | `0x20000000` (user-mapped device page, NX) |
+| VirtIO DMA queue alias | `0x30000000` (only mapped in the storage server) |
 
-The kernel's `load_elf` (`kernel/src/elf.rs`) validates and maps exactly this
-shape. The load base was chosen to avoid the kernel (physical `0x100000`) and
-the user stack top (`USER_STACK_VADDR = 0xFFF000`). Confirm it is free against
-`kernel/src/paging.rs` before changing it.
+Every `PT_LOAD`, including any load segment containing the ELF/program headers,
+must lie wholly inside the ELF window. `kernel/build.rs` checks the generated
+images before embedding them. The kernel retains a supervisor-only identity map
+of the first 128 MiB; no part of that mapping is user-accessible. Each process
+gets separate user page frames and a private stack.
 
-## Entry trampoline
+`userspace/build.sh` links with `--image-base=0x10000000 -no-pie -e _start`.
+`_start` sets RSP to the private stack top passed by the address-space contract,
+then calls that binary's `main`.
 
-The loader jumps to `_start` with user page tables active but a minimal stack.
-The runtime's `_start` (in `src/lib.rs`) sets the user stack top and calls the
-program's `main`:
+## Syscall convention
 
-```rust
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    core::arch::asm!("mov rsp, 0xFFF000", options(nostack)); // USER_STACK_VADDR
-    main(); // never returns
-}
-```
+The `syscall` instruction uses:
 
-Each program is a separate bin target defining its own:
+| Register | Role |
+|---|---|
+| `rax` | syscall number and return value |
+| `rdi`, `rsi`, `rdx` | arguments 1–3 |
+| `r10`, `r8` | arguments 4–5 |
 
-```rust
-#[no_mangle] pub extern "C" fn main() -> ! { … }
-```
+The instruction and kernel entry clobber `rcx`, `r11`, and caller-saved argument
+registers. The Rust wrappers declare those clobbers. User pointers are accepted
+only when every touched page is present, user-accessible, and has the requested
+read/write permission.
 
-## Syscall convention (x86-64 `syscall` instruction)
+## IPC message layout
 
-| Register | Role                              |
-|----------|-----------------------------------|
-| `rax`    | syscall number                    |
-| `rdi`    | arg1                              |
-| `rsi`    | arg2                              |
-| `rdx`    | arg3                              |
-| `r10`    | arg4                              |
-| `r8`     | arg5                              |
+`IpcMessage` is a 64-byte `repr(C)` structure shared byte-for-byte with the
+kernel: `src_pid: u16`, `msg_type: u16`, and `data: [u8; 60]`. A compile-time
+assertion in `src/lib.rs` protects the size. The kernel replaces `src_pid` with
+the actual sender PID.
 
-This matches the kernel's SYSCALL entry path (`kernel/src/syscall.rs`, lines 32,
-104, 793) and `boot.S`. The runtime wraps this in `syscall0..syscall3`; only
-those four are implemented. Return value comes back in `rax` as an `isize`.
+## Storage-server device grant
 
-## Syscall numbers (`src/lib.rs::syscall_nr`)
+When a legacy VirtIO-blk PCI function is found, the kernel sends the storage
+server an initial `MSG_STORAGE_CONFIG` IPC message:
 
-| Name        | nr | Wrapper            |
-|-------------|----|--------------------|
-| `EXIT`      | 0  | `sys_exit`         |
-| `WRITE`     | 1  | `sys_write(fd, buf, count)` |
-| `READ`      | 2  | —                  |
-| `IPC_SEND`  | 3  | `ipc_send(dst_pid, msg_ptr)` |
-| `IPC_RECV`  | 4  | `ipc_recv(buf_ptr)` |
-| `BRK`       | 5  | —                  |
-| `GETPID`    | 6  | —                  |
-| `VGA_WRITE` | 7  | —                  |
-| `SCHEDULE`  | 9  | —                  |
+- `data[0..2]`: BAR0 I/O-port base (`u16`, little-endian)
+- `data[2..10]`: physical base of four contiguous DMA pages (`u64`, little-endian)
 
-Keep these in sync with the kernel; a mismatch silently calls the wrong handler.
+The kernel maps those pages at `DMA_QUEUE_VADDR` only in that process and grants
+the BAR0 port range through the TSS I/O-permission bitmap. The process runs the
+VirtIO request protocol and FAT16 parser itself. Ring 3 never receives global
+IOPL=3 or access to unrelated ports.
 
-## IPC message layout (`src/lib.rs::IpcMessage`)
-
-Exact byte-for-byte copy of `kernel/src/process.rs::IpcMessage`. The kernel
-copies this struct across sender/receiver address spaces, so any divergence
-corrupts payloads. A compile-time assertion in `lib.rs` fails the build if it
-ever drifts from 64 bytes.
-
-```rust
-#[repr(C)]
-pub struct IpcMessage {
-    pub src_pid: u16,          // filled in by the kernel
-    pub msg_type: u16,         // interpreted by the receiver
-    pub data: [u8; 60],        // payload; total struct = 64 bytes
-}
-```
-
-High-level helpers: `ipc_send(dst_pid, msg_ptr)` → `IPC_SEND` (`syscall2`);
-`ipc_recv(buf_ptr)` → `IPC_RECV` (`syscall1`).
-
-## Build producing ET_EXEC @ 0x400000
-
-Run `./build.sh [bin] [release]`. It invokes cargo from a scratch directory so
-the repo-root `.cargo/config.toml` (which injects the kernel linker script)
-cannot leak in, and passes the required link args via `--config`:
-
-```
--Ttext=0x400000  -no-pie  -e _start
-```
-
-Verify:
+## User-facing build check
 
 ```bash
-readelf -h target/x86_64-unknown-none/debug/deps/<bin>-<hash>
-# → Type: EXEC, Entry point: 0x4000a0 (inside the 0x400000 load region)
+./build.sh vga --out /tmp/learnos-images
+readelf -h -l /tmp/learnos-images/vga.elf
 ```
+
+The expected type is `EXEC`, and every `LOAD` virtual range must be within the
+user ELF window above. The kernel build performs the same validation for all
+embedded service images.

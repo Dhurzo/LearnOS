@@ -1,0 +1,1 @@
+[2026-09-24T21:07:58+02:00] Phase 1 COMPLETED — userspace crate builds as ET_EXEC @0x400000 (entry 0x4000a0); fixed PIE via out-of-tree build.sh + --config; added ABI.md

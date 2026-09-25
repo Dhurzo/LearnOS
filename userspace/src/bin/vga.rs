@@ -2,7 +2,7 @@
 //!
 //! In a microkernel, even the display driver runs in user space. The kernel
 //! maps the physical VGA text buffer (0xB8000) into this process's page tables
-//! at virtual address `VGA_BUFFER_VADDR` (0x600000) before starting us — see
+//! at virtual address `VGA_BUFFER_VADDR` (0x20000000) before starting us — see
 //! `kernel/src/main.rs` (map_phys_page on the vga server's cr3). We then write
 //! characters directly to video memory with no per-character syscall overhead.
 //!
@@ -16,7 +16,7 @@
 use userspace::{ipc_recv, syscall0, syscall_nr, IpcMessage};
 
 /// Virtual address of the VGA text buffer (mapped by the loader for this process).
-const VGA_BUFFER_VADDR: usize = 0x600000;
+const VGA_BUFFER_VADDR: usize = 0x20000000;
 /// Standard VGA text-mode grid.
 const VGA_COLS: usize = 80;
 const VGA_ROWS: usize = 25;

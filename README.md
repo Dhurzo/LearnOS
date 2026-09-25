@@ -1,7 +1,9 @@
 # LearnOS - Educational Microkernel
 
-A minimal x86_64 microkernel written in Rust, built in 4 incremental phases.
-Each phase adds one capability without breaking what came before.
+A small x86-64 educational microkernel written in Rust. The target is a
+single-core QEMU PVH system; this is a learning project, not a production OS.
+Services are standalone ring-3 ELFs, and filesystem/device policy belongs in
+user processes rather than in the kernel.
 
 ## What is a Microkernel?
 
@@ -12,18 +14,25 @@ Everything else — drivers, filesystems, services — runs in unprivileged user
 ┌─────────────────────────────────────────────────┐
 │                 KERNEL SPACE (ring 0)           │
 │  ┌──────────────────────────────────────────┐  │
-│  │ Scheduling    │ Memory Mgmt │ IPC │ IRQs │  │
+│  │ Scheduling │ VM │ IPC │ caps │ IRQ/resource grants │  │
 │  └──────────────────────────────────────────┘  │
 └──────────────────────┬──────────────────────────┘
                        │ syscalls / IPC
            ┌───────────┼──────────────┬───────────┐
            ▼           ▼              ▼           ▼
      ┌─────────┐ ┌─────────┐ ┌────────────┐ ┌─────────┐
-     │  Init   │ │  Shell  │ │ VGA Server │ │Kbd Svr  │
-     │  PID 3  │ │  PID 4  │ │   PID 1    │ │ PID 2   │
-     └─────────┘ └─────────┘ └────────────┘ └─────────┘
-                     USER SPACE (ring 3)
+      │  Init   │ │  Shell  │ │ VGA Server │ │Kbd Svr  │
+      │ PID 4   │ │ PID 5  │ │ PID 1      │ │ PID 3   │
+      └─────────┘ └─────────┘ └────────────┘ └─────────┘
+                      USER SPACE (ring 3)
+                  ┌─────────────────────────────┐
+                  │ IRQ router PID 2            │
+                  │ Storage/FAT server PID 6*   │
+                  └─────────────────────────────┘
 ```
+
+`*` The storage server is spawned only when a legacy VirtIO-blk device is
+found and the boot path grants it BAR0 ports plus a private DMA queue mapping.
 
 If a user-space service crashes, the kernel and other services keep running.
 
@@ -40,7 +49,8 @@ If a user-space service crashes, the kernel and other services keep running.
    │  "1" at screen top — entered Rust             │
    ├─ Initialize frame allocator (bitmap) ────────┤
    │  32512 frames from 0x100000 to 0x8000000      │
-   ├─ Initialize RAM disk (128 KiB) ──────────────┤
+    ├─ Discover legacy VirtIO PCI resources ──────┤
+    │  Reserve contiguous DMA pages for user server │
    ├─ Enable CR4.PGE ────────────────────────────┤
    │  (kernel page-table entries survive CR3 swap) │
    ├─ Set up TSS + syscall MSRs ─────────────────┤
@@ -48,10 +58,10 @@ If a user-space service crashes, the kernel and other services keep running.
    │  "4" — IDT configured                        │
    ├─ Spawn user processes ──────────────────────┤
    │  "V" VGA server (PID 1)                      │
-   │  "K" Keyboard server (PID 2)                 │
-   │  "I" Init (PID 3)                            │
-   │  "S" Shell (PID 4)                           │
-   │  "5" — All processes created                 │
+    │  IRQ router (PID 2), keyboard (PID 3)         │
+    │  Init (PID 4), shell (PID 5)                  │
+    │  Storage/FAT server (PID 6 if device exists)  │
+    │  "5" — User services created                 │
    ├─ Remap PIC + program PIT timer (100 Hz) ────┤
    │  "T" — Timer configured                      │
    ├─ Unmask IRQ0 (timer) + IRQ1 (keyboard) ─────┤
@@ -64,18 +74,16 @@ If a user-space service crashes, the kernel and other services keep running.
 |--------|-------------|---------|
 | `boot.S` | assembly | PVH entry note, 32→64-bit bootstrap |
 | `main.rs` | Rust | Entry point, boot sequencing, hardware init |
-| `paging.rs` | Rust | 4-level page tables, bitmap frame allocator, COW |
+| `paging.rs` | Rust | Supervisor direct map, private user pages/stacks, bitmap allocator, COW |
 | `process.rs` | Rust | PCB, IPC queues, round-robin scheduler, fork/exec |
 | `syscall.rs` | Rust | Syscall dispatch, IDT setup, MSRs, IRQ handlers |
 | `tss.rs` | Rust | Task State Segment (kernel stack on ring transitions) |
 | `interrupt_server.rs` | Rust | IRQ handler table, forwarding to user-space drivers |
 | `vga.rs` | Rust | Fallback VGA writes, serial debug output |
 | `elf.rs` | Rust | ELF-64 parser, LOAD-segment mapper |
-| `filesystem.rs` | Rust | Embedded flat filesystem with open/read/close |
-| `block_dev.rs` | Rust | 128 KiB RAM disk with 512-byte block interface |
+| `pci.rs` | Rust | Minimal PCI resource discovery for user-space device assignment |
 | `capability.rs` | Rust | Capability-bitmap grant/revoke/check |
 | `signal.rs` | Rust | Signal pending bitmap, delivery, handler dispatch |
-| `user_program.rs` | Rust | Built-in user-space programs (VGA, keyboard, init, shell) |
 | `linker.ld` | script | Kernel ELF layout, PVH note placement |
 
 ### Virtual Address Space (per-process)

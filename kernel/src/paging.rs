@@ -26,16 +26,17 @@
 //! ADDRESS SPACE LAYOUT
 //! =============================================================================
 //!
-//! Per-process page tables isolate user memory. The kernel region (identity
-//! mapped, first few MB) is accessible only from ring 0 (U=0). User pages
-//! have U=1 so they're accessible from ring 3.
+//! Per-process page tables isolate user memory. Every process gets the same
+//! supervisor-only identity map for the 128 MiB QEMU reference machine so the
+//! kernel can reach its linked image, TSS, kernel stacks, page tables, and
+//! allocator frames after changing CR3. User images and stacks are mapped at
+//! separate virtual addresses; none of the identity map is user-accessible.
 //!
-//!   PML4[0] → PDPT[0] → PD (512 × 2MB entries or 4KB PTs)
-//!     PD[0]   0x00000000 - 0x001FFFFF  Kernel code  (2MB huge, U=0)
-//!     PD[1]   0x00200000 - 0x003FFFFF  Kernel data  (2MB huge, U=0)
-//!     PD[2]   0x00400000 - 0x005FFFFF  Split into 4KB PT for user code (U=1)
-//!     PD[3-6] Not present
-//!     PD[7]   0x00E00000 - 0x00FFFFFF  User stack   (2MB huge, U=1)
+//!   PML4[0] → PDPT[0] → PD
+//!     PD[0..63]   0x00000000 - 0x07FFFFFF  supervisor identity map (2 MiB)
+//!     PD[128]     0x10000000 onward        user ELF PTs (4 KiB, U=1)
+//!     PD[256]     0x20000000               user VGA alias (4 KiB, U=1)
+//!   PML4[255] → private user stack PTs near 0x00007FFF_FFFF_F000
 //!
 //! Physical memory beyond 16MB is used by the frame allocator for dynamic
 //! page-table allocation and user-program code pages.
@@ -104,26 +105,37 @@ unsafe fn mark_frame_in_use(phys: u64) {
 // ADDRESS CONSTANTS
 // =============================================================================
 
-/// User process code load address (typical ELF load address)
-pub const USER_VADDR_LOAD: u64 = 0x0000000000400000;
+/// User process code base. This is deliberately outside the kernel's physical
+/// identity-map window, so a kernel virtual address can never alias user code.
+pub const USER_VADDR_LOAD: u64 = 0x0000000010000000;
 pub const USER_VADDR_START: u64 = USER_VADDR_LOAD;
+/// End of the user ELF image window. The next region is reserved for device
+/// aliases (e.g. VGA), so malformed ELFs cannot replace those mappings.
+pub const USER_ELF_VADDR_END: u64 = 0x0000000020000000;
 
-/// User virtual address limit
-pub const USER_VADDR_END: u64 = 0x00007FFFFFFFFFFF;
+/// Exclusive end of the canonical lower-half user address range.
+pub const USER_VADDR_END: u64 = 0x0000800000000000;
 
-/// User process stack — top address (grows down).
-/// Must be within a 2MB region that maps to a user-accessible huge page (PD[7]).
-pub const USER_STACK_VADDR: u64 = 0x0000000000FFF000;
+/// User process stack — top address (grows down). Each process receives its
+/// own 64 KiB of 4 KiB pages here; the unmapped page below it is a guard page.
+pub const USER_STACK_VADDR: u64 = 0x00007FFFFFFFF000;
 
 /// Virtual address for the VGA text buffer when mapped into a user-space driver.
-/// Uses PD[3] range (0x600000-0x7FFFFF), currently unused in the address-space layout.
-pub const VGA_BUFFER_VADDR: u64 = 0x0000000000600000;
+/// Kept outside both the kernel identity map and the user ELF range.
+pub const VGA_BUFFER_VADDR: u64 = 0x0000000020000000;
+
+/// User alias for the two-page legacy virtio queue owned by the storage
+/// process. Its physical backing is passed to the device; this virtual alias
+/// is only how ring 3 fills descriptors and reads completions.
+pub const DMA_QUEUE_VADDR: u64 = 0x0000000030000000;
+/// Contiguous pages reserved for the legacy queue plus scratch request data.
+pub const DMA_QUEUE_PAGES: usize = 4;
 
 /// Physical address of the VGA text mode buffer (80×25 colour).
 pub const VGA_PHYS_ADDR: u64 = 0xB8000;
 
-/// Stack size (8KB)
-pub const USER_STACK_SIZE: u64 = 0x2000;
+/// Stack size (64 KiB). Kernel stacks are separate and supervisor-only.
+pub const USER_STACK_SIZE: u64 = 0x10000;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -212,6 +224,51 @@ pub fn alloc_frame() -> u64 {
         }
     }
     0 // Out of memory
+}
+
+/// Allocate `count` physically contiguous 4 KiB frames for a DMA device.
+///
+/// Device descriptors contain physical addresses, so a collection of adjacent
+/// virtual pages is not enough: the allocator must reserve adjacent frame
+/// numbers. The kernel identity-maps its managed physical window supervisor-
+/// only, while the owning user driver gets an explicit user mapping of these
+/// frames. QEMU RAM is below 4 GiB, satisfying legacy virtio's 32-bit queue PFN.
+pub fn alloc_contiguous_frames(count: usize) -> Option<u64> {
+    if count == 0 || count > NUM_FRAMES {
+        return None;
+    }
+    unsafe {
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for frame_idx in 0..NUM_FRAMES {
+            let word_idx = frame_idx / 64;
+            let bit_idx = frame_idx % 64;
+            if FRAME_BITMAP[word_idx] & (1u64 << bit_idx) != 0 {
+                if run_len == 0 {
+                    run_start = frame_idx;
+                }
+                run_len += 1;
+                if run_len == count {
+                    for idx in run_start..run_start + count {
+                        FRAME_BITMAP[idx / 64] &= !(1u64 << (idx % 64));
+                        let phys = frame_idx_to_addr(idx);
+                        core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE as usize);
+                    }
+                    return Some(frame_idx_to_addr(run_start));
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+    }
+    None
+}
+
+/// Return a contiguous allocation made by [`alloc_contiguous_frames`].
+pub fn free_contiguous_frames(base: u64, count: usize) {
+    for index in 0..count {
+        free_frame(base + (index as u64) * PAGE_SIZE);
+    }
 }
 
 /// Allocate and zero a 4 KB frame, returning the physical address.
@@ -371,6 +428,51 @@ pub unsafe fn free_page_table_tree(pml4_phys: u64) {
     free_frame(pml4_phys);
 }
 
+/// Release all user leaf frames owned by a newly built address space, then its
+/// page-table frames. This is for construction rollback before the address
+/// space is shared (e.g. a malformed ELF); it must NOT be used on a COW child.
+/// Device aliases such as VGA sit below PHYS_MEM_START, so `free_frame` ignores
+/// them while reclaiming ordinary user frames from the allocator's pool.
+pub unsafe fn free_user_address_space(pml4_phys: u64) {
+    for pml4_idx in 0..PT_ENTRIES {
+        let pml4e = read_pt_entry(pml4_phys, pml4_idx);
+        if pml4e & page_flags::PRESENT == 0 {
+            continue;
+        }
+        let pdpt = pml4e & ENTRY_PHYS_MASK;
+        for pdpt_idx in 0..PT_ENTRIES {
+            let pdpte = read_pt_entry(pdpt, pdpt_idx);
+            if pdpte & page_flags::PRESENT == 0 || pdpte & page_flags::USER_ACCESS == 0 {
+                continue;
+            }
+            if pdpte & page_flags::LARGE != 0 {
+                // This kernel does not create user 1 GiB pages. Do not free a
+                // potentially shared huge mapping during rollback.
+                continue;
+            }
+            let pd = pdpte & ENTRY_PHYS_MASK;
+            for pd_idx in 0..PT_ENTRIES {
+                let pde = read_pt_entry(pd, pd_idx);
+                if pde & page_flags::PRESENT == 0 || pde & page_flags::USER_ACCESS == 0 {
+                    continue;
+                }
+                if pde & page_flags::LARGE != 0 {
+                    // User huge pages are not part of the supported layout.
+                    continue;
+                }
+                let pt = pde & ENTRY_PHYS_MASK;
+                for pt_idx in 0..PT_ENTRIES {
+                    let pte = read_pt_entry(pt, pt_idx);
+                    if pte & page_flags::PRESENT != 0 && pte & page_flags::USER_ACCESS != 0 {
+                        free_frame(pte & ENTRY_PHYS_MASK);
+                    }
+                }
+            }
+        }
+    }
+    free_page_table_tree(pml4_phys);
+}
+
 // =============================================================================
 // PAGE TABLE HELPERS
 // =============================================================================
@@ -409,40 +511,56 @@ const ENTRY_PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// level page table rooted at `pml4_phys`.
 ///
 /// Returns `Ok((phys_of_vaddr, page_size))` where `phys_of_vaddr` is the exact
-/// physical address backing `vaddr` and `page_size` is 0x1000 (4KB), 0x2000
-/// (2MB) or 0x40000 (1GB). Every entry on the path must be PRESENT and WRITABLE;
-/// otherwise returns `Err(())`.
+/// physical address backing `vaddr` and `page_size` is 0x1000 (4KB), 0x200000
+/// (2MB) or 0x40000000 (1GB). Every entry on the path must be PRESENT, WRITABLE,
+/// and USER; otherwise returns `Err(())`. Checking the USER bit at every level
+/// prevents this user-memory helper from walking supervisor-only mappings.
 ///
 /// # Safety
 ///
 /// `pml4_phys` must point to a valid PML4 frame. The caller owns the walk.
-pub unsafe fn resolve_user_page(pml4_phys: u64, vaddr: u64) -> Result<(u64, usize), ()> {
+pub unsafe fn resolve_user_page_access(
+    pml4_phys: u64,
+    vaddr: u64,
+    write: bool,
+) -> Result<(u64, usize), ()> {
     // Level 1: PML4 -> PDPT
     let pml4e = read_pt_entry(pml4_phys, ((vaddr >> 39) & 0x1ff) as usize);
-    if pml4e & page_flags::PRESENT == 0 || pml4e & page_flags::WRITABLE == 0 {
+    if pml4e & page_flags::PRESENT == 0
+        || pml4e & page_flags::USER_ACCESS == 0
+        || (write && pml4e & page_flags::WRITABLE == 0)
+    {
         return Err(());
     }
     let pdpt_phys = pml4e & ENTRY_PHYS_MASK;
 
     // Level 2: PDPT -> PD (or a 1GB huge page)
     let pdpte = read_pt_entry(pdpt_phys, ((vaddr >> 30) & 0x1ff) as usize);
-    if pdpte & page_flags::PRESENT == 0 || pdpte & page_flags::WRITABLE == 0 {
+    if pdpte & page_flags::PRESENT == 0
+        || pdpte & page_flags::USER_ACCESS == 0
+        || (write && pdpte & page_flags::WRITABLE == 0)
+    {
         return Err(());
     }
     if pdpte & page_flags::LARGE != 0 {
-        let base = pdpte & !0x3FFF_FFFF; // 1GB-aligned
-        return Ok((base + (vaddr & 0x3FFF_FFFF), 0x40000));
+        let size = 0x4000_0000u64; // 1 GiB
+        let base = pdpte & ENTRY_PHYS_MASK & !(size - 1);
+        return Ok((base + (vaddr & (size - 1)), size as usize));
     }
 
     // Level 3: PD -> PT (or a 2MB huge page)
     let pd_phys = pdpte & ENTRY_PHYS_MASK;
     let pde = read_pt_entry(pd_phys, ((vaddr >> 21) & 0x1ff) as usize);
-    if pde & page_flags::PRESENT == 0 || pde & page_flags::WRITABLE == 0 {
+    if pde & page_flags::PRESENT == 0
+        || pde & page_flags::USER_ACCESS == 0
+        || (write && pde & page_flags::WRITABLE == 0)
+    {
         return Err(());
     }
     if pde & page_flags::LARGE != 0 {
-        let base = pde & !0x1FFF; // 2MB-aligned
-        return Ok((base + (vaddr & 0x1FFF), 0x2000));
+        let size = 0x20_0000u64; // 2 MiB
+        let base = pde & ENTRY_PHYS_MASK & !(size - 1);
+        return Ok((base + (vaddr & (size - 1)), size as usize));
     }
 
     // Level 4: PT -> 4KB page. The leaf lives in the *page table* pointed to by the
@@ -450,11 +568,20 @@ pub unsafe fn resolve_user_page(pml4_phys: u64, vaddr: u64) -> Result<(u64, usiz
     // index the wrong table and always fail for real 4KB mappings.
     let pt_phys = pde & ENTRY_PHYS_MASK;
     let pte = read_pt_entry(pt_phys, ((vaddr >> 12) & 0x1ff) as usize);
-    if pte & page_flags::PRESENT == 0 || pte & page_flags::WRITABLE == 0 {
+    if pte & page_flags::PRESENT == 0
+        || pte & page_flags::USER_ACCESS == 0
+        || (write && pte & page_flags::WRITABLE == 0)
+    {
         return Err(());
     }
     let base = pte & !0xFFF; // 4KB-aligned
     Ok((base + (vaddr & 0xFFF), 0x1000))
+}
+
+/// Resolve a writable user mapping. Kept as the default for kernel-to-user
+/// writes such as signal frames; read-only user pages remain rejected.
+pub unsafe fn resolve_user_page(pml4_phys: u64, vaddr: u64) -> Result<(u64, usize), ()> {
+    resolve_user_page_access(pml4_phys, vaddr, true)
 }
 
 /// Write `data` to user virtual address `vaddr`, translating through the page
@@ -525,9 +652,14 @@ pub unsafe fn copy_page_table_cow(src_pml4: u64) -> u64 {
             }
 
             if src_pdpte & page_flags::LARGE != 0 {
-                // 1 GB huge page — copy the PDE as-is but mark COW
-                let cow_pdpte = (src_pdpte & !page_flags::WRITABLE) | page_flags::COW;
-                write_pt_entry(dst_pdpt, pdpt_idx, cow_pdpte);
+                // Kernel huge mappings are shared supervisor mappings, not
+                // process-owned COW data. Only user leaves become read-only.
+                let copied = if src_pdpte & page_flags::USER_ACCESS != 0 {
+                    (src_pdpte & !page_flags::WRITABLE) | page_flags::COW
+                } else {
+                    src_pdpte
+                };
+                write_pt_entry(dst_pdpt, pdpt_idx, copied);
                 continue;
             }
 
@@ -543,9 +675,15 @@ pub unsafe fn copy_page_table_cow(src_pml4: u64) -> u64 {
                 }
 
                 if src_pde & page_flags::LARGE != 0 {
-                    // 2 MB huge page — mark COW
-                    let cow_pde = (src_pde & !page_flags::WRITABLE) | page_flags::COW;
-                    write_pt_entry(dst_pd, pd_idx, cow_pde);
+                    // Preserve the shared supervisor direct map. If user huge
+                    // pages are added later, COW must apply symmetrically to
+                    // parent and child just like the 4 KiB path below.
+                    let copied = if src_pde & page_flags::USER_ACCESS != 0 {
+                        (src_pde & !page_flags::WRITABLE) | page_flags::COW
+                    } else {
+                        src_pde
+                    };
+                    write_pt_entry(dst_pd, pd_idx, copied);
                     continue;
                 }
 
@@ -564,13 +702,19 @@ pub unsafe fn copy_page_table_cow(src_pml4: u64) -> u64 {
                         write_pt_entry(dst_pt, pt_idx, src_pte);
                         continue;
                     }
-                    // Mark as read-only + COW in the *new* page table
+                    // Both address spaces must become read-only. If only the
+                    // child were marked COW, parent writes would mutate memory
+                    // still shared with the child without taking a fault.
                     let cow_pte = (src_pte & !page_flags::WRITABLE) | page_flags::COW;
                     write_pt_entry(dst_pt, pt_idx, cow_pte);
+                    write_pt_entry(src_pt, pt_idx, cow_pte);
                 }
             }
         }
     }
+    // Parent PTEs were changed from writable to read-only; discard any cached
+    // writable translations before returning to user mode.
+    core::arch::asm!("mov cr3, {}", in(reg) src_pml4, options(nostack));
     dst_pml4
 }
 
@@ -642,81 +786,97 @@ pub unsafe fn handle_cow_fault(cr3: u64, fault_addr: u64) -> bool {
 
 /// Create a set of per-process page tables.
 ///
-/// Layout:
-///   PML4[0] → PDPT[0] → PD
-///     PD[0]: 0x00000000-0x001FFFFF (kernel, 2MB huge, U=0)
-///     PD[1]: 0x00200000-0x003FFFFF (kernel, 2MB huge, U=0)
-///     PD[2]: 0x00400000-0x005FFFFF → PT (4KB entries, user code)
-///     PD[7]: 0x00E00000-0x00FFFFFF (user stack, 2MB huge, U=1)
+/// The first 128 MiB are identity-mapped supervisor-only. This keeps the
+/// low-linked kernel and its direct access to managed physical frames valid
+/// after CR3 changes. User ELFs begin at 256 MiB, outside that kernel window;
+/// stacks are separately allocated near the top of the lower canonical half.
 ///
-/// Arguments:
-///   `code_phys`: physical address of user code to map at 0x400000
-///
-/// Returns the physical address of the new PML4 (to be loaded into CR3).
-pub fn create_address_space(code_phys: Option<u64>) -> u64 {
+/// `code_phys`, when present, is mapped at [`USER_VADDR_LOAD`]. Returns `None`
+/// on OOM instead of treating physical address zero as a valid page table.
+pub fn create_address_space(code_phys: Option<u64>) -> Option<u64> {
     unsafe {
-        // === Level 4: PML4 ===
         let pml4 = alloc_zeroed_frame();
-        // Enable CR4.PGE so kernel pages with G bit survive CR3 switches
-        // (done once in main.rs — see enable_pge())
-
-        // === Level 3: PDPT ===
-        let pdpt = alloc_zeroed_frame();
-        let pdpt_ent = (pdpt & 0x000FFFFFFFFFF000)
-            | page_flags::PRESENT
-            | page_flags::WRITABLE
-            | page_flags::USER_ACCESS;
-        write_pt_entry(pml4, 0, pdpt_ent);
-
-        // === Level 2: PD ===
-        let pd = alloc_zeroed_frame();
-        let pd_ent = (pd & 0x000FFFFFFFFFF000)
-            | page_flags::PRESENT
-            | page_flags::WRITABLE
-            | page_flags::USER_ACCESS;
-        write_pt_entry(pdpt, 0, pd_ent);
-
-        // --- PD[0]: identity map 0x000000-0x1FFFFF (kernel code) ---
-        // USER_ACCESS required: when the timer fires at CPL=3, the CPU must read
-        // the GDT (code segment descriptor) and TSS (for stack switch) which live
-        // in this region.  Without U=1 the CPU cannot complete the privilege-level
-        // transition and raises #GP(0x0102) referencing the IDT gate.
-        write_pt_entry(pd, 0, 0x000000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS | page_flags::LARGE));
-
-        // --- PD[1]: identity map 0x200000-0x3FFFFF (kernel data + IDT) ---
-        // USER_ACCESS required: the IDT itself lives at 0x200000.  The CPU reads
-        // the IDT gate descriptor before switching CPL, so the page must be
-        // accessible while the processor is still at CPL=3.
-        write_pt_entry(pd, 1, 0x200000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS | page_flags::LARGE));
-
-        // --- PD[2]: user code region 0x400000-0x5FFFFF → 4KB PT ---
-        let pt_code = alloc_zeroed_frame();
-        // Map code_phys at virtual 0x400000 (PT index 0 covers 0x400000-0x400FFF).
-        // When `code_phys` is None the page table is left empty so a caller can
-        // populate it later via `map_phys_page`/`elf::load_elf` — used by
-        // `spawn_from_elf`, which loads an ELF image into its own LOAD segments.
-        let code_flags = page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS;
-        if let Some(frame) = code_phys {
-            write_pt_entry(pt_code, 0, (frame & 0x000FFFFFFFFFF000) | code_flags);
+        if pml4 == 0 {
+            return None;
         }
-        // PD[2] points to PT (no LARGE bit — this is a regular 4KB-page directory)
+        let pdpt = alloc_zeroed_frame();
+        if pdpt == 0 {
+            free_frame(pml4);
+            return None;
+        }
+        let pd = alloc_zeroed_frame();
+        if pd == 0 {
+            free_frame(pdpt);
+            free_frame(pml4);
+            return None;
+        }
+
+        // Upper levels allow user mappings in this PML4 slot. Kernel leaf
+        // entries below deliberately omit USER_ACCESS, so CPL3 remains denied.
         write_pt_entry(
-            pd,
-            2,
-            (pt_code & 0x000FFFFFFFFFF000) | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
+            pml4,
+            0,
+            pdpt | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
+        );
+        write_pt_entry(
+            pdpt,
+            0,
+            pd | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
         );
 
-        // --- PD[3-6]: Not present (zero already from alloc_zeroed_frame) ---
+        // The frame allocator's supported range and the supervisor map must
+        // agree. The bootstrap page tables map this same physical window.
+        let kernel_flags = page_flags::PRESENT | page_flags::WRITABLE | page_flags::LARGE;
+        for pd_idx in 0..(PHYS_MEM_END / (2 * 1024 * 1024)) as usize {
+            let phys = (pd_idx as u64) * 2 * 1024 * 1024;
+            write_pt_entry(pd, pd_idx, phys | kernel_flags);
+        }
 
-        // --- PD[7]: identity map 0xE00000-0xFFFFFF (user stack, 2MB huge, U=1) ---
-        write_pt_entry(
-            pd,
-            7,
-            0xE00000 | (page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS | page_flags::LARGE),
-        );
+        if let Some(frame) = code_phys {
+            let user_flags = page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS;
+            if !map_phys_page(pml4, USER_VADDR_LOAD, frame, user_flags) {
+                free_page_table_tree(pml4);
+                return None;
+            }
+        }
 
-        pml4
+        Some(pml4)
     }
+}
+
+/// Allocate and map a private user stack for one process.
+///
+/// Every process uses the same virtual stack range, but each page maps to a
+/// distinct physical frame. The page below the stack remains unmapped as a
+/// guard so stack overflow faults rather than corrupting adjacent memory.
+pub fn map_user_stack(pml4_phys: u64) -> bool {
+    let stack_start = USER_STACK_VADDR - USER_STACK_SIZE;
+    let mut vaddr = stack_start;
+    while vaddr < USER_STACK_VADDR {
+        let frame = alloc_frame();
+        if frame == 0 {
+            unsafe { munmap_range(pml4_phys, stack_start, vaddr - stack_start); }
+            return false;
+        }
+        let mapped = unsafe {
+            map_phys_page(
+                pml4_phys,
+                vaddr,
+                frame,
+                page_flags::PRESENT
+                    | page_flags::WRITABLE
+                    | page_flags::USER_ACCESS
+                    | page_flags::EXECUTABLE_DISABLE,
+            )
+        };
+        if !mapped {
+            free_frame(frame);
+            unsafe { munmap_range(pml4_phys, stack_start, vaddr - stack_start); }
+            return false;
+        }
+        vaddr += PAGE_SIZE;
+    }
+    true
 }
 
 /// Enable Page Global Enable (CR4.PGE) so kernel pages marked Global survive
@@ -784,7 +944,10 @@ pub unsafe fn enable_pge() {
 /// - `phys` must be 4 KB aligned.
 /// - `virt` is the desired canonical virtual address.
 /// - The caller must ensure no aliasing / double-map violations.
-pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
+pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> bool {
+    if pml4_phys == 0 || phys & (PAGE_SIZE - 1) != 0 || virt & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
     // Extract the 9-bit index for each page-table level from the virtual address.
     // Each index selects one of 512 entries in its respective table.
     let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
@@ -806,26 +969,49 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     } else {
         // Allocate a new PDPT frame and link it into the PML4
         let frame = alloc_zeroed_frame();
+        if frame == 0 {
+            return false;
+        }
         // Propagate USER_ACCESS from the PTE flags up through intermediate entries
         let iflags = page_flags::PRESENT | page_flags::WRITABLE
             | (flags & page_flags::USER_ACCESS);
         write_pt_entry(pml4_phys, pml4_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
+    let pml4e_current = read_pt_entry(pml4_phys, pml4_idx);
+    if flags & page_flags::USER_ACCESS != 0
+        && pml4e_current & page_flags::USER_ACCESS == 0
+    {
+        write_pt_entry(pml4_phys, pml4_idx, pml4e_current | page_flags::USER_ACCESS);
+    }
 
     // =========================================================================
     // LEVEL 3: Walk PDPT → PD
     // =========================================================================
     let pdpte = read_pt_entry(pdpt, pdpt_idx);
+    if pdpte & page_flags::PRESENT != 0 && pdpte & page_flags::LARGE != 0 {
+        // A 1 GiB leaf is not a page table. Refuse instead of treating mapped
+        // data (which could be the IDT or another device structure) as one.
+        return false;
+    }
     let pd = if pdpte & page_flags::PRESENT != 0 {
         pdpte & 0x000FFFFFFFFFF000
     } else {
         let frame = alloc_zeroed_frame();
+        if frame == 0 {
+            return false;
+        }
         let iflags = page_flags::PRESENT | page_flags::WRITABLE
             | (flags & page_flags::USER_ACCESS);
         write_pt_entry(pdpt, pdpt_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
+    let pdpte_current = read_pt_entry(pdpt, pdpt_idx);
+    if flags & page_flags::USER_ACCESS != 0
+        && pdpte_current & page_flags::USER_ACCESS == 0
+    {
+        write_pt_entry(pdpt, pdpt_idx, pdpte_current | page_flags::USER_ACCESS);
+    }
 
     // =========================================================================
     // LEVEL 2: Walk PD → PT
@@ -834,15 +1020,30 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     // huge page (set the LARGE bit in the PDE), but for device-memory mappings
     // like the VGA buffer at 0xB8000, a single 4KB page is all we need.
     let pde = read_pt_entry(pd, pd_idx);
+    if pde & page_flags::PRESENT != 0 && pde & page_flags::LARGE != 0 {
+        // A 2 MiB huge mapping has no lower-level PT to write into. Splitting
+        // it must be explicit; silently interpreting its physical base as a
+        // PT corrupts whatever lives at that address (historically the IDT).
+        return false;
+    }
     let pt = if pde & page_flags::PRESENT != 0 {
         pde & 0x000FFFFFFFFFF000
     } else {
         let frame = alloc_zeroed_frame();
+        if frame == 0 {
+            return false;
+        }
         let iflags = page_flags::PRESENT | page_flags::WRITABLE
             | (flags & page_flags::USER_ACCESS);
         write_pt_entry(pd, pd_idx, (frame & 0x000FFFFFFFFFF000) | iflags);
         frame
     };
+    let pde_current = read_pt_entry(pd, pd_idx);
+    if flags & page_flags::USER_ACCESS != 0
+        && pde_current & page_flags::USER_ACCESS == 0
+    {
+        write_pt_entry(pd, pd_idx, pde_current | page_flags::USER_ACCESS);
+    }
 
     // =========================================================================
     // LEVEL 1: Write the final 4 KB PTE
@@ -852,6 +1053,9 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     // PRESENT | WRITABLE | USER_ACCESS, and for device memory we also
     // set CACHE_DISABLE (PCD bit) — because writing to VGA memory with
     // caching enabled can cause stale reads or unpredictable behaviour.
+    if read_pt_entry(pt, pt_idx) & page_flags::PRESENT != 0 {
+        return false; // Refuse aliases/overwrites; callers must split explicitly.
+    }
     let pte = (phys & 0x000FFFFFFFFFF000) | flags;
     write_pt_entry(pt, pt_idx, pte);
 
@@ -859,6 +1063,7 @@ pub unsafe fn map_phys_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     // its device memory directly via virtual addresses — no syscall needed
     // for each character write. This is the key performance advantage of
     // user-space drivers in a microkernel.
+    true
 }
 
 // =============================================================================
@@ -967,19 +1172,19 @@ mod delivery_tests {
     unsafe fn link_4kb(pml4: u64, pdpt: u64, pd: u64, pt: u64, virt: u64, leaf_phys: u64) {
         write_pt_entry(
             pml4, ((virt >> 39) & 0x1ff) as usize,
-            pdpt | page_flags::PRESENT | page_flags::WRITABLE,
+            pdpt | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
         );
         write_pt_entry(
             pdpt, ((virt >> 30) & 0x1ff) as usize,
-            pd | page_flags::PRESENT | page_flags::WRITABLE,
+            pd | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
         );
         write_pt_entry(
             pd, ((virt >> 21) & 0x1ff) as usize,
-            pt | page_flags::PRESENT | page_flags::WRITABLE,
+            pt | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
         );
         write_pt_entry(
             pt, ((virt >> 12) & 0x1ff) as usize,
-            leaf_phys | page_flags::PRESENT | page_flags::WRITABLE,
+            leaf_phys | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
         );
     }
 
@@ -1000,6 +1205,70 @@ mod delivery_tests {
             assert_eq!(size, 0x1000);
             // Physical address must be the backing frame plus vaddr's in-page offset.
             assert_eq!(phys, leaf as u64 + (USER_STACK_VADDR & 0xfff));
+        }
+    }
+
+    #[test]
+    fn resolve_uses_real_2mb_page_size_and_offset() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            write_pt_entry(
+                pml4 as u64,
+                0,
+                pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
+            );
+            write_pt_entry(
+                pdpt as u64,
+                0,
+                pd as u64 | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
+            );
+            let base = 0x4000_0000u64;
+            let vaddr = USER_VADDR_LOAD + 0x1F_2345;
+            let pd_idx = ((vaddr >> 21) & 0x1ff) as usize;
+            write_pt_entry(
+                pd as u64,
+                pd_idx,
+                base
+                    | page_flags::PRESENT
+                    | page_flags::WRITABLE
+                    | page_flags::USER_ACCESS
+                    | page_flags::LARGE,
+            );
+
+            let (phys, size) = resolve_user_page(pml4 as u64, vaddr).unwrap();
+            assert_eq!(size, 0x20_0000);
+            assert_eq!(phys, base + (vaddr & 0x1F_FFFF));
+        }
+    }
+
+    #[test]
+    fn resolve_uses_real_1gb_page_size_and_offset() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            write_pt_entry(
+                pml4 as u64,
+                0,
+                pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS,
+            );
+            let base = 0x4000_0000u64;
+            let vaddr = base + 0x1234_5678;
+            let pdpt_idx = ((vaddr >> 30) & 0x1ff) as usize;
+            write_pt_entry(
+                pdpt as u64,
+                pdpt_idx,
+                base
+                    | page_flags::PRESENT
+                    | page_flags::WRITABLE
+                    | page_flags::USER_ACCESS
+                    | page_flags::LARGE,
+            );
+
+            let (phys, size) = resolve_user_page(pml4 as u64, vaddr).unwrap();
+            assert_eq!(size, 0x4000_0000);
+            assert_eq!(phys, base + (vaddr & 0x3FFF_FFFF));
         }
     }
 
@@ -1039,11 +1308,12 @@ mod delivery_tests {
 
             // Both pages live under pdpt[0] -> pd[0] -> pt, but map to different
             // physical leaves via distinct PT entries (entry 1 and entry 2).
-            write_pt_entry(pml4 as u64, 0, pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
-            write_pt_entry(pdpt as u64, 0, pd as u64 | page_flags::PRESENT | page_flags::WRITABLE);
-            write_pt_entry(pd as u64, 0, pt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
-            write_pt_entry(pt as u64, (0x1000 >> 12) & 0x1ff, leaf_a as u64 | page_flags::PRESENT | page_flags::WRITABLE);
-            write_pt_entry(pt as u64, (0x2000 >> 12) & 0x1ff, leaf_b as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            let user_rw = page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS;
+            write_pt_entry(pml4 as u64, 0, pdpt as u64 | user_rw);
+            write_pt_entry(pdpt as u64, 0, pd as u64 | user_rw);
+            write_pt_entry(pd as u64, 0, pt as u64 | user_rw);
+            write_pt_entry(pt as u64, 1, leaf_a as u64 | user_rw);
+            write_pt_entry(pt as u64, 2, leaf_b as u64 | user_rw);
 
             // 9 bytes starting at 0x1FF8: 8 land in page A (..0x1FFF), 1 spills
             // into page B (0x2000).
@@ -1096,10 +1366,33 @@ mod delivery_tests {
             let leaf = alloc_frame();
             // Present but NOT writable (read-only page) -> must be rejected so we
             // never write to a read-only mapping.
+            let user_rw = page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS;
+            write_pt_entry(pml4 as u64, 0, pdpt as u64 | user_rw);
+            write_pt_entry(pdpt as u64, 0, pd as u64 | user_rw);
+            write_pt_entry(pd as u64, 0, pt as u64 | user_rw);
+            write_pt_entry(
+                pt as u64,
+                (0x1000 >> 12) & 0x1ff,
+                leaf as u64 | page_flags::PRESENT | page_flags::USER_ACCESS,
+            );
+            assert!(resolve_user_page(pml4 as u64, 0x1000).is_err());
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_supervisor_mapping_even_when_writable() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf = alloc_frame();
+            // This is the kernel's identity-map permission shape: every entry
+            // is present and writable, but U=0 must keep ring-3 copy helpers out.
             write_pt_entry(pml4 as u64, 0, pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
             write_pt_entry(pdpt as u64, 0, pd as u64 | page_flags::PRESENT | page_flags::WRITABLE);
             write_pt_entry(pd as u64, 0, pt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
-            write_pt_entry(pt as u64, (0x1000 >> 12) & 0x1ff, leaf as u64 | page_flags::PRESENT);
+            write_pt_entry(pt as u64, 1, leaf as u64 | page_flags::PRESENT | page_flags::WRITABLE);
             assert!(resolve_user_page(pml4 as u64, 0x1000).is_err());
         }
     }

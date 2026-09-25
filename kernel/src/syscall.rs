@@ -54,6 +54,9 @@ static mut VGA_SERVER_PID: u16 = 0;
 /// PID of the user-space keyboard input server (0 = not yet spawned).
 pub static mut KEYBOARD_SERVER_PID: u16 = 0;
 
+/// PID of the user-space storage server (VirtIO protocol + FAT service).
+static mut STORAGE_SERVER_PID: u16 = 0;
+
 /// Set the PID of the VGA server (called during boot after spawning it).
 pub fn set_vga_server_pid(pid: u16) {
     unsafe { VGA_SERVER_PID = pid };
@@ -62,6 +65,11 @@ pub fn set_vga_server_pid(pid: u16) {
 /// Set the PID of the keyboard server (called during boot after spawning it).
 pub fn set_keyboard_server_pid(pid: u16) {
     unsafe { KEYBOARD_SERVER_PID = pid };
+}
+
+/// Set the storage service endpoint after it is successfully spawned.
+pub fn set_storage_server_pid(pid: u16) {
+    unsafe { STORAGE_SERVER_PID = pid };
 }
 
 pub mod syscall_nr {
@@ -80,22 +88,11 @@ pub mod syscall_nr {
     pub const GET_SERVER_PID: usize = 10;
     // Phase 2 — Process creation
     pub const FORK: usize = 13;
-    pub const EXEC: usize = 14;
     // Phase 4 — Hardening
     pub const REGISTER_IRQ: usize = 15;
     pub const CAP_SEND: usize = 16;
     pub const REGISTER_SIGNAL: usize = 17;
     pub const WAIT_SIGNAL: usize = 18;
-    // Phase 3 — ELF loader
-    pub const EXEC_ELF: usize = 19;
-    // Phase 3 — File system
-    pub const OPEN: usize = 20;
-    pub const FS_READ: usize = 21;
-    pub const CLOSE: usize = 22;
-    pub const READDIR: usize = 23;
-    // Phase 6 — Raw block access (userspace filesystem lives here)
-    pub const BLOCK_READ: usize = 24;
-    pub const BLOCK_WRITE: usize = 25;
 }
 
 /// The legacy INT 0x80 vector is defined here for reference.
@@ -165,24 +162,13 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::IPC_SEND] = Some(sys_ipc_send);
     table.handlers[syscall_nr::IPC_RECV] = Some(sys_ipc_recv);
     table.handlers[syscall_nr::GET_SERVER_PID] = Some(sys_get_server_pid);
-    // Phase 2 — Process creation
+    // Process creation
     table.handlers[syscall_nr::FORK] = Some(sys_fork);
-    table.handlers[syscall_nr::EXEC] = Some(sys_exec);
     // Phase 4 — System hardening
     table.handlers[syscall_nr::REGISTER_IRQ] = Some(sys_register_irq);
     table.handlers[syscall_nr::CAP_SEND] = Some(sys_cap_send);
     table.handlers[syscall_nr::REGISTER_SIGNAL] = Some(sys_register_signal);
     table.handlers[syscall_nr::WAIT_SIGNAL] = Some(sys_wait_signal);
-    // Phase 3 — ELF loader
-    table.handlers[syscall_nr::EXEC_ELF] = Some(sys_exec_elf);
-    // Phase 3 — File system
-    table.handlers[syscall_nr::OPEN] = Some(sys_open);
-    table.handlers[syscall_nr::FS_READ] = Some(sys_fs_read);
-    table.handlers[syscall_nr::CLOSE] = Some(sys_close);
-    table.handlers[syscall_nr::READDIR] = Some(sys_readdir);
-    // Phase 6 — Raw block access (userspace filesystem)
-    table.handlers[syscall_nr::BLOCK_READ] = Some(sys_block_read);
-    table.handlers[syscall_nr::BLOCK_WRITE] = Some(sys_block_write);
     table
 };
 
@@ -193,23 +179,44 @@ pub static SYSCALL_TABLE: SyscallTable = {
 /// are supported. Returns the number of bytes written on success,
 /// or `-1` on failure.
 fn sys_write(fd: usize, buf: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if (fd == 1 || fd == 2) && buf >= 0x400000 && buf < 0x800000000 {
-        let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
-        for &byte in slice {
-            vga::write_byte(byte);
+    if fd != 1 && fd != 2 {
+        return -1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    let count = count.min(4096);
+    if is_valid_user_range(buf, count, false) {
+        let mut written = 0usize;
+        for i in 0..count {
+            let byte = unsafe { core::ptr::read((buf as *const u8).add(i)) };
+            if sys_vga_write(byte as usize, 0, 0, 0, 0, syscall_nr::VGA_WRITE) < 0 {
+                return if written == 0 { -1 } else { written as isize };
+            }
+            written += 1;
         }
-        count as isize
+        written as isize
     } else {
         -1
     }
 }
 
-/// EXIT: Terminate the calling process and halt the system.
-///
-/// In this educational OS, there is no user-level cleanup — exiting simply
-/// enters an infinite loop (a real kernel would free resources and reboot).
+/// EXIT: mark only the caller terminated. The syscall returns to the user
+/// trampoline, which spins until the next timer interrupt switches away; the
+/// global kernel must never busy-loop with interrupts disabled for one process.
 fn sys_exit(_code: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    loop {}
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    unsafe {
+        let table = core::ptr::addr_of_mut!(process::PROCESS_TABLE);
+        if let Some(p) = (*table).get_mut(current) {
+            p.state = process::ProcessState::Terminated;
+            return 0;
+        }
+    }
+    -1
 }
 
 /// VGA_WRITE: Send a single ASCII byte to the VGA display server for rendering.
@@ -268,9 +275,11 @@ fn sys_vga_clear(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr
 /// selects the next runnable process via round-robin. This only yields when
 /// interrupts are enabled; preemptive scheduling happens through the timer IRQ.
 fn sys_schedule(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    // Cooperative yield — only works when interrupts are enabled.
-    // The timer handler handles preemptive scheduling.
-    process::schedule_next();
+    // The timer interrupt is the only path that currently owns a complete
+    // saved user frame and can safely switch CR3/registers. Merely changing
+    // CURRENT_PID here would return to this same caller while attributing its
+    // next syscall to another process. Treat SCHEDULE as a safe hint/no-op;
+    // preemption still happens on the next timer tick.
     0
 }
 
@@ -290,6 +299,7 @@ fn sys_get_server_pid(server: usize, _a2: usize, _a3: usize, _a4: usize, _a5: us
         1 => unsafe { VGA_SERVER_PID as isize },
         2 => unsafe { KEYBOARD_SERVER_PID as isize },
         3 => unsafe { INTERRUPT_SERVER_PID as isize },
+        4 => unsafe { STORAGE_SERVER_PID as isize },
         _ => -1,
     }
 }
@@ -298,26 +308,68 @@ fn sys_get_server_pid(server: usize, _a2: usize, _a3: usize, _a4: usize, _a5: us
 // IPC SYSCALL HANDLERS
 // =============================================================================
 
-/// Check whether an address is in user-accessible memory range.
-fn is_valid_user_ptr(ptr: usize) -> bool {
-    // User code is mapped at 0x400000. User stack is near 0x7FFF...
-    // Anything below 0x400000 or above 0x8000000000 is not user space.
-    ptr >= 0x400000 && ptr < 0x800000000
+/// Check that every page touched by a user buffer is mapped for the requested
+/// access in the *calling process's* CR3.
+///
+/// LESSON (safe copy boundary): a numeric range check alone is not sufficient.
+/// The address may fall in an unmapped hole, cross into a supervisor page, or
+/// wrap at `usize::MAX`. Walking each page-table leaf before touching it turns
+/// those cases into a normal syscall error instead of a fault while CPL=0.
+fn is_valid_user_range(ptr: usize, len: usize, write: bool) -> bool {
+    let user_start = crate::paging::USER_VADDR_START as usize;
+    let user_end = crate::paging::USER_VADDR_END as usize;
+    let end = match ptr.checked_add(len) {
+        Some(end) => end,
+        None => return false,
+    };
+    if ptr < user_start || ptr >= user_end || end > user_end {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+
+    let current = process::get_current_pid();
+    let cr3 = unsafe {
+        let table = core::ptr::addr_of!(process::PROCESS_TABLE);
+        match (*table).get(current) {
+            Some(p) => p.cr3,
+            None => return false,
+        }
+    };
+
+    let mut page = (ptr as u64) & !0xFFF;
+    let end = end as u64;
+    while page < end {
+        let page_size = match unsafe {
+            crate::paging::resolve_user_page_access(cr3, page, write)
+        } {
+            Ok((_, size)) => size as u64,
+            Err(()) => return false,
+        };
+        let next = (page & !(page_size - 1)).saturating_add(page_size);
+        if next <= page {
+            return false;
+        }
+        page = next;
+    }
+    true
 }
 
-/// Check whether a WHOLE user buffer `[ptr, ptr + len)` lies in user space.
-///
-/// LESSON (validation scope): checking only the START pointer is not enough.
-/// A buffer starting at a valid address but extending past the user region
-/// (or wrapping around the address space via `ptr + len` overflow) would let
-/// a caller read/write kernel memory. `checked_add` turns the wraparound case
-/// into `None` instead of a wrapped address that passes the range test.
-fn is_valid_user_range(ptr: usize, len: usize) -> bool {
-    match ptr.checked_add(len) {
-        // `end` is one-past-the-last-byte; `<=` keeps the exclusive bound
-        // consistent with `is_valid_user_ptr` above.
-        Some(end) => ptr >= 0x400000 && end <= 0x800000000,
-        None => false, // wrapped around the address space: reject outright
+/// Ask the kernel capability table whether the current process holds a
+/// privileged operation right. User processes cannot forge this bitmap from
+/// ring 3 because the PCB is in the supervisor-only identity map.
+fn current_process_has_capability(cap: usize) -> bool {
+    let current = process::get_current_pid();
+    if current == 0 {
+        return false;
+    }
+    unsafe {
+        let table = core::ptr::addr_of!(process::PROCESS_TABLE);
+        (*table)
+            .get(current)
+            .map(|p| crate::capability::has(p.capabilities, cap))
+            .unwrap_or(false)
     }
 }
 
@@ -336,7 +388,7 @@ fn sys_ipc_send(dst_pid: usize, msg_ptr: usize, _a3: usize, _a4: usize, _a5: usi
         return -1;
     }
     // Validate the user-space pointer
-    if !is_valid_user_ptr(msg_ptr) {
+    if !is_valid_user_range(msg_ptr, core::mem::size_of::<process::IpcMessage>(), false) {
         return -1;
     }
 
@@ -388,7 +440,7 @@ fn sys_ipc_send(dst_pid: usize, msg_ptr: usize, _a3: usize, _a4: usize, _a5: usi
 /// kernel-side IPC queue into the user-provided buffer.
 /// Returns 64 (bytes copied) on success, or -1 if the queue is empty.
 fn sys_ipc_recv(buf_ptr: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if !is_valid_user_ptr(buf_ptr) {
+    if !is_valid_user_range(buf_ptr, core::mem::size_of::<process::IpcMessage>(), true) {
         return -1;
     }
 
@@ -421,7 +473,7 @@ fn sys_ipc_recv(buf_ptr: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, 
 /// Returns the child's PID on success, or -1 on failure (table full).
 fn sys_fork(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     let current = process::get_current_pid();
-    if current == 0 {
+    if current == 0 || !current_process_has_capability(crate::capability::cap_id::FORK) {
         return -1; // kernel can't fork
     }
     unsafe {
@@ -436,311 +488,6 @@ fn sys_fork(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usi
     }
 }
 
-/// EXEC: Replace the current process image with an ELF binary loaded
-/// from the embedded filesystem.
-///
-/// a1 = path string pointer (user-space, null-terminated)
-/// a2 = maximum path length to read (bytes)
-///
-/// Returns 0 on success, -1 on error.
-fn sys_exec(path_ptr: usize, path_max: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    let current = process::get_current_pid();
-    if current == 0 || path_ptr == 0 || path_max == 0 {
-        return -1;
-    }
-
-    // Copy path from user space (up to 63 chars)
-    let max_len = path_max.min(63);
-    let mut path_buf = [0u8; 64];
-    unsafe {
-        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), max_len);
-    }
-    // Ensure null termination
-    path_buf[max_len] = 0;
-
-    let len = path_buf.iter().position(|&c| c == 0).unwrap_or(max_len);
-    if len == 0 {
-        return -1;
-    }
-    let path_str = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-
-    unsafe {
-        let pt = &raw mut process::PROCESS_TABLE;
-        if (*pt).load_elf_into_process(current, path_str) {
-            crate::vga::serial_print("exec: pid -> ");
-            0
-        } else {
-            -1
-        }
-    }
-}
-
-// =============================================================================
-// PHASE 3 — ELF LOADER SYSCALL
-// =============================================================================
-
-/// EXEC_ELF: Load an ELF binary from memory into the current process.
-///
-/// a1 = pointer to ELF data in user space
-/// a2 = size of ELF data in bytes
-///
-/// Returns 0 on success, -1 on failure.
-fn sys_exec_elf(data_ptr: usize, data_size: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    let current = process::get_current_pid();
-    if current == 0 {
-        return -1;
-    }
-    if data_ptr == 0 || data_size < 64 {
-        return -1;
-    }
-    // Validate user pointer
-    if !is_valid_user_ptr(data_ptr) {
-        return -1;
-    }
-
-    unsafe {
-        // Read ELF data from user space into a kernel buffer (up to 64 KiB)
-        let max_size = data_size.min(65536);
-        let mut elf_buf: core::mem::MaybeUninit<[u8; 65536]> = core::mem::MaybeUninit::uninit();
-        let buf_ptr = elf_buf.as_mut_ptr() as *mut u8;
-        core::ptr::copy_nonoverlapping(data_ptr as *const u8, buf_ptr, max_size);
-        let elf_data = core::slice::from_raw_parts(buf_ptr, max_size);
-
-        let pt = &raw mut process::PROCESS_TABLE;
-        if let Some(proc) = (*pt).get_mut(current) {
-            // Use the ELF loader to map segments into the process's page table
-            match crate::elf::load_elf(elf_data, proc.cr3) {
-                Ok(result) => {
-                    // Reset registers and set entry point
-                    proc.entry_point = result.entry;
-                    proc.registers = process::ProcessRegisters::default();
-                    proc.registers.rsp = result.stack_top;
-                    proc.registers.rip = result.entry;
-                    crate::vga::serial_print("exec_elf: ok\n");
-                    0
-                }
-                Err(_e) => {
-                    crate::vga::serial_print("exec_elf: err\n");
-                    -1
-                }
-            }
-        } else {
-            -1
-        }
-    }
-}
-
-// =============================================================================
-// PHASE 3 — FILE SYSTEM SYSCALLS
-// =============================================================================
-
-/// OPEN: Open a file by name.
-///
-/// a1 = pointer to filename string in user space
-/// a2 = max filename length to read
-///
-/// Returns a file descriptor (>= 0) on success, or -1 on error.
-fn sys_open(name_ptr: usize, name_max: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    let current = process::get_current_pid();
-    if current == 0 || !is_valid_user_ptr(name_ptr) || name_max == 0 {
-        return -1;
-    }
-
-    // Copy filename from user space
-    let max_len = name_max.min(31);
-    let mut name_buf = [0u8; 32];
-    unsafe {
-        core::ptr::copy_nonoverlapping(name_ptr as *const u8, name_buf.as_mut_ptr(), max_len);
-    }
-    // Null-terminate
-    name_buf[max_len] = 0;
-
-    // Find null terminator and create str
-    let len = name_buf.iter().position(|&c| c == 0).unwrap_or(max_len);
-    if len == 0 {
-        return -1;
-    }
-    let name = core::str::from_utf8(&name_buf[..len]).unwrap_or("");
-
-    match crate::filesystem::open(current, name) {
-        Some(fd) => fd as isize,
-        None => -1,
-    }
-}
-
-/// FS_READ: Read from an open file descriptor.
-///
-/// a1 = file descriptor
-/// a2 = pointer to user-space buffer
-/// a3 = number of bytes to read
-///
-/// Returns bytes read, or -1 on error.
-fn sys_fs_read(fd: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    let current = process::get_current_pid();
-    if current == 0 || !is_valid_user_ptr(buf_ptr) || count == 0 {
-        return -1;
-    }
-
-    let max_count = count.min(4096); // Safety limit
-    let mut kernel_buf = [0u8; 4096];
-
-    match crate::filesystem::read(current, fd, &mut kernel_buf[..max_count]) {
-        Some(bytes_read) => {
-            if bytes_read > 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        kernel_buf.as_ptr(),
-                        buf_ptr as *mut u8,
-                        bytes_read,
-                    );
-                }
-            }
-            bytes_read as isize
-        }
-        None => -1,
-    }
-}
-
-/// CLOSE: Close an open file descriptor.
-///
-/// a1 = file descriptor
-///
-/// Returns 0 on success, -1 on error.
-fn sys_close(fd: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    let current = process::get_current_pid();
-    if current == 0 {
-        return -1;
-    }
-    if crate::filesystem::close(current, fd) {
-        0
-    } else {
-        -1
-    }
-}
-
-/// READDIR: List files in the directory.
-///
-/// a1 = pointer to user-space buffer for file names
-/// a2 = buffer size
-///
-/// Returns number of bytes written, or -1 on error.
-fn sys_readdir(buf_ptr: usize, buf_size: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if !is_valid_user_ptr(buf_ptr) || buf_size == 0 {
-        return -1;
-    }
-
-    let max_size = buf_size.min(4096);
-    let mut kernel_buf = [0u8; 4096];
-
-    let written = crate::filesystem::list(&mut kernel_buf[..max_size]);
-    if written > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, written);
-        }
-    }
-    written as isize
-}
-
-// =============================================================================
-// PHASE 6 — RAW BLOCK ACCESS SYSCALLS
-// =============================================================================
-//
-// These syscalls let user-space filesystem code read/write raw 512-byte blocks
-// through the kernel's virtio-blk driver. The kernel owns the device; all
-// filesystem logic (FAT16 parsing, directory listing, etc.) lives in user space
-// and reaches storage only via these two calls. See DECISIONS.md [Phase 6].
-
-/// BLOCK_READ: Read `count` bytes from a byte offset into the block store.
-///
-/// a1 = byte offset (into the whole device)
-/// a2 = pointer to user-space buffer
-/// a3 = number of bytes to read
-///
-/// Returns the number of bytes actually read, or -1 on failure.
-fn sys_block_read(offset: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if count == 0 {
-        return -1;
-    }
-    // Clamp FIRST, validate SECOND: the kernel staging buffer holds 4096
-    // bytes, so the kernel will never touch more than that — validate exactly
-    // the range we will actually copy to.
-    let count = count.min(4096);
-    if !is_valid_user_range(buf_ptr, count) {
-        return -1;
-    }
-    let mut kernel_buf = [0u8; 4096];
-    let read = crate::block_dev::read_bytes(offset, &mut kernel_buf[..count]);
-    if read > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                kernel_buf.as_ptr(),
-                buf_ptr as *mut u8,
-                read,
-            );
-        }
-    }
-    read as isize
-}
-
-/// BLOCK_WRITE: Write `count` bytes from a buffer to a byte offset.
-///
-/// a1 = byte offset (into the whole device)
-/// a2 = pointer to user-space buffer
-/// a3 = number of bytes to write
-///
-/// Returns the number of bytes actually written, or -1 on failure.
-fn sys_block_write(offset: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if count == 0 {
-        return -1;
-    }
-    // Clamp FIRST (see sys_block_read): an earlier revision looped over the
-    // ORIGINAL `count` while the staging buffer only held 4096 bytes, so any
-    // write larger than one page copied uninitialised stack bytes to disk.
-    let count = count.min(4096);
-    if !is_valid_user_range(buf_ptr, count) {
-        return -1;
-    }
-    let mut kernel_buf = [0u8; 4096];
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf_ptr as *const u8, kernel_buf.as_mut_ptr(), count);
-    }
-    // Write in whole-block granularity (512 bytes).
-    //
-    // LESSON (read-modify-write): storage only transfers FULL blocks, but the
-    // caller may ask to write a partial range (e.g. 100 bytes in the middle of
-    // a block). An earlier revision built each block from a ZEROED buffer and
-    // copied only the caller's bytes into it — silently ZEROING the neighbour
-    // bytes that shared those blocks (data corruption on every partial write!).
-    // The correct pattern: for edge blocks that are only partly covered, READ
-    // the block first, patch the covered bytes in, then write it back. Only
-    // fully-covered blocks may skip the read.
-    let mut written = 0usize;
-    while written < count {
-        let blk_off = offset + written; // byte offset of the next byte to store
-        let block = blk_off / crate::block_dev::BLOCK_SIZE;
-        let off_in_block = blk_off % crate::block_dev::BLOCK_SIZE;
-        let chunk = (count - written).min(crate::block_dev::BLOCK_SIZE - off_in_block);
-        let full_cover = off_in_block == 0 && chunk == crate::block_dev::BLOCK_SIZE;
-        let mut buf = if full_cover {
-            [0u8; crate::block_dev::BLOCK_SIZE]
-        } else {
-            // Partial edge block: preserve the bytes we are NOT rewriting.
-            let mut b = [0u8; crate::block_dev::BLOCK_SIZE];
-            if !crate::block_dev::read_block(block, &mut b) {
-                break; // unreadable block: stop, report what we wrote so far
-            }
-            b
-        };
-        buf[off_in_block..off_in_block + chunk]
-            .copy_from_slice(&kernel_buf[written..written + chunk]);
-        if !crate::block_dev::write_block(block, &buf) {
-            break;
-        }
-        written += chunk;
-    }
-    written as isize
-}
-
 // =============================================================================
 // PHASE 4 — SYSTEM HARDENING SYSCALLS
 // =============================================================================
@@ -750,7 +497,9 @@ fn sys_block_write(offset: usize, buf_ptr: usize, count: usize, _a4: usize, _a5:
 /// a1 = IRQ vector number (e.g. 0x21 for keyboard)
 /// a2 = handler PID (-1 = self)
 fn sys_register_irq(vector: usize, handler_pid: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
-    if vector >= 256 {
+    if vector >= 256
+        || !current_process_has_capability(crate::capability::cap_id::IRQ_REGISTER)
+    {
         return -1;
     }
     let pid = if handler_pid == !0usize {
@@ -773,7 +522,7 @@ fn sys_register_irq(vector: usize, handler_pid: usize, _a3: usize, _a4: usize, _
 /// -1 otherwise.
 fn sys_cap_send(dst_pid: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     let current = process::get_current_pid();
-    if current == 0 {
+    if current == 0 || dst_pid > u16::MAX as usize {
         return -1;
     }
     unsafe {
@@ -832,27 +581,15 @@ fn sys_wait_signal(timeout: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usiz
                 p.signal_pending &= !(1u64 << sig);
                 return sig as isize;
             }
-            // If timeout == 0 (poll), return immediately
-            if timeout == 0 {
-                return -1;
-            }
-            // Block until a signal arrives or the deadline elapses. Record the
-            // deadline in kernel ticks so check_deadlines() can wake us via the
-            // timer. We still return to userland via sysretq (the kernel cannot
-            // stay blocked inside a syscall without abandoning the sysretq/iretq
-            // stack discipline); the recorded deadline plus state=Blocked ensure
-            // that when we are next scheduled, either the signal is already pending
-            // or our deadline has elapsed and check_deadlines() wakes us. (The
-            // `deadline` field disambiguates a signal-wait from an I/O-block: only
-            // waiters set a non-zero deadline.) The absolute-deadline math lives in
-            // the host-tested `signal_state` crate.
-            p.deadline = signal_state::compute_deadline(process::current_tick(), timeout as u64);
-            p.state = process::ProcessState::Blocked;
+            // Until syscall-return context switching is implemented, this
+            // syscall is an explicit poll. Do not mark the caller BLOCKED here:
+            // SYSCALL returns to the same user instruction stream and cannot
+            // switch processes by changing only CURRENT_PID. `timeout` is
+            // reserved for the future blocking ABI; callers get -1 on no signal.
+            let _ = timeout;
+            return -1;
         }
     }
-    // Yield and let scheduler pick another process
-    process::schedule_next();
-    // When we wake up, check again
     -1
 }
 
@@ -1082,6 +819,54 @@ core::arch::global_asm!(
     "    iretq",
 
     // =========================================================================
+    // #PF (PAGE FAULT, vector 0x0E)
+    // =========================================================================
+    // Unlike timer_entry, the CPU also pushes a page-fault error code. After the
+    // 15 GP-register pushes the frame is:
+    //   [0..14] saved GP regs, [15] error, [16] RIP, [17] CS,
+    //   [18] RFLAGS, [19] user RSP, [20] user SS.
+    // The extra error-code word changes call alignment by eight bytes.
+    ".globl pf_entry",
+    ".type pf_entry, @function",
+    "pf_entry:",
+    "    push rax",
+    "    push rcx",
+    "    push rdx",
+    "    push rbx",
+    "    push rbp",
+    "    push rsi",
+    "    push rdi",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov rdi, rsp",
+    "    sub rsp, 8", // align the C ABI call; original frame remains in RDI
+    "    call page_fault_save_and_switch",
+    "    add rsp, 8",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop r11",
+    "    pop r10",
+    "    pop r9",
+    "    pop r8",
+    "    pop rdi",
+    "    pop rsi",
+    "    pop rbp",
+    "    pop rbx",
+    "    pop rdx",
+    "    pop rcx",
+    "    pop rax",
+    "    add rsp, 8", // discard CPU-pushed error code before iretq
+    "    iretq",
+
+    // =========================================================================
     // #GP (GENERAL PROTECTION FAULT) ENTRY POINT (vector 0x0D)
     // =========================================================================
     //
@@ -1126,6 +911,7 @@ extern "C" {
     static syscall_entry: u8;
     static timer_entry: u8;
     static keyboard_entry: u8;
+    static pf_entry: u8;
     static gp_entry: u8;
     static df_entry: u8;
 }
@@ -1222,13 +1008,19 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 /// memory with the expected layout.
 #[no_mangle]
 pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
-    use crate::process::{ProcessState, PROCESS_TABLE};
+    use crate::process::ProcessState;
+
+    // This function is called from the real IDT `timer_entry`; update the
+    // monotonic clock here rather than in an unused parallel handler.
+    crate::timer_tick();
 
     let current = process::get_current_pid();
 
+    let table = core::ptr::addr_of_mut!(process::PROCESS_TABLE);
+
     // === 1. Save current process state ===
     if current != 0 {
-        if let Some(p) = PROCESS_TABLE.get_mut(current) {
+        if let Some(p) = (*table).get_mut(current) {
             p.registers.rax    = *frame.add(14);
             p.registers.rbx    = *frame.add(11);
             p.registers.rcx    = *frame.add(13);
@@ -1260,44 +1052,165 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
     // === 3. Pick next process ===
     process::schedule_next();
 
-    // === 4. Load next process state into the stack frame ===
-    let next = process::get_current_pid();
-    if next != 0 {
-        if let Some(p) = PROCESS_TABLE.get_mut(next) {
-            *frame.add(14) = p.registers.rax;
-            *frame.add(11) = p.registers.rbx;
-            *frame.add(13) = p.registers.rcx;
-            *frame.add(12) = p.registers.rdx;
-            *frame.add(9)  = p.registers.rsi;
-            *frame.add(8)  = p.registers.rdi;
-            *frame.add(10) = p.registers.rbp;
-            *frame.add(18) = p.registers.rsp;
-            *frame.add(7)  = p.registers.r8;
-            *frame.add(6)  = p.registers.r9;
-            *frame.add(5)  = p.registers.r10;
-            *frame.add(4)  = p.registers.r11;
-            *frame.add(3)  = p.registers.r12;
-            *frame.add(2)  = p.registers.r13;
-            *frame.add(1)  = p.registers.r14;
-            *frame.add(0)  = p.registers.r15;
-            *frame.add(15) = p.registers.rip;
-            *frame.add(17) = p.registers.rflags;
+    // === 4. Load the next process into the interrupt frame. ===
+    // Deliver signals before copying registers: delivery may change RIP/RSP.
+    // Also release the PCB borrow before the signal code mutates the process table.
+    loop {
+        let next = process::get_current_pid();
+        if next == 0 {
+            loop { core::arch::asm!("cli", "hlt", options(nostack)); }
+        }
+        crate::signal::deliver_pending(next);
 
-            // === 5. Deliver pending signals to the next process ===
-            crate::signal::deliver_pending(next);
+        let next_state = if let Some(p) = (*table).get_mut(next) {
+            if p.state == ProcessState::Terminated {
+                None
+            } else {
+                p.state = ProcessState::Running;
+                Some((p.registers, p.cr3, p.kernel_stack_top, p.io_port_ranges, p.io_port_range_count))
+            }
+        } else {
+            None
+        };
+        let (regs, cr3, kernel_stack_top, io_ranges, io_range_count) = match next_state {
+            Some(state) => state,
+            None => {
+                process::schedule_next();
+                continue;
+            }
+        };
 
-            // === 7. Switch to next process's address space ===
-            // Write CR3 with the next process's PML4 physical address.
-            // This TLB-flushes all non-global entries automatically.
-            core::arch::asm!("mov cr3, {}", in(reg) p.cr3, options(nostack));
+        *frame.add(14) = regs.rax;
+        *frame.add(11) = regs.rbx;
+        *frame.add(13) = regs.rcx;
+        *frame.add(12) = regs.rdx;
+        *frame.add(9) = regs.rsi;
+        *frame.add(8) = regs.rdi;
+        *frame.add(10) = regs.rbp;
+        *frame.add(18) = regs.rsp;
+        *frame.add(7) = regs.r8;
+        *frame.add(6) = regs.r9;
+        *frame.add(5) = regs.r10;
+        *frame.add(4) = regs.r11;
+        *frame.add(3) = regs.r12;
+        *frame.add(2) = regs.r13;
+        *frame.add(1) = regs.r14;
+        *frame.add(0) = regs.r15;
+        *frame.add(15) = regs.rip;
+        *frame.add(17) = regs.rflags;
 
-            // === 8. Update TSS.RSP0 so interrupts use this process's kernel stack ===
-            crate::tss::TSS.set_rsp0(p.kernel_stack_top);
+        // Kernel identity mappings are supervisor-only and present in every
+        // process; changing CR3 therefore preserves the active kernel stack.
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+        crate::tss::TSS.set_rsp0(kernel_stack_top);
+        crate::tss::TSS.set_io_port_ranges(&io_ranges[..io_range_count]);
+        crate::tss::CURRENT_KERNEL_RSP = kernel_stack_top;
+        break;
+    }
+}
 
-            // === 9. Update syscall kernel stack (syscall doesn't use TSS.RSP0) ===
-            crate::tss::CURRENT_KERNEL_RSP = p.kernel_stack_top;
+/// Resolve a user COW fault or terminate the faulting process and resume the
+/// next runnable process through the same hardware interrupt frame.
+///
+/// # Safety
+/// `frame` is the stack pointer supplied by `pf_entry`: saved r15 starts at 0,
+/// the CPU page-fault error code is at 15, and the iret frame starts at 16.
+#[no_mangle]
+pub unsafe extern "C" fn page_fault_save_and_switch(frame: *mut u64) {
+    let error = *frame.add(15);
+    let cs = *frame.add(17);
+    if cs & 3 != 3 {
+        // A kernel page fault indicates a kernel bug. Do not try to return to an
+        // unknown kernel instruction with corrupted state.
+        crate::vga::serial_print("kernel page fault at ");
+        let fault: u64;
+        core::arch::asm!("mov {}, cr2", out(reg) fault, options(nostack));
+        crate::vga::serial_print_hex("", fault);
+        loop {
+            core::arch::asm!("cli", "hlt", options(nostack));
+        }
+    }
 
-            p.state = ProcessState::Running;
+    let fault_address: u64;
+    core::arch::asm!("mov {}, cr2", out(reg) fault_address, options(nostack));
+    let current = process::get_current_pid();
+    if current == 0 {
+        loop {
+            core::arch::asm!("cli", "hlt", options(nostack));
+        }
+    }
+
+    let table = core::ptr::addr_of_mut!(process::PROCESS_TABLE);
+    let current_cr3 = match (*table).get(current) {
+        Some(p) => p.cr3,
+        None => 0,
+    };
+
+    // Page-fault error bits: P=bit0, W/R=bit1, U/S=bit2. Only a user write
+    // protection fault can be a COW fault; all other user faults kill that
+    // process rather than executing an invalid mapping in ring 0.
+    if current_cr3 != 0 && error & 0b111 == 0b111
+        && crate::paging::handle_cow_fault(current_cr3, fault_address)
+    {
+        return; // mapping is writable now; assembly restores this frame and iretq
+    }
+
+    if let Some(p) = (*table).get_mut(current) {
+        p.state = process::ProcessState::Terminated;
+    }
+    crate::vga::serial_print("user process fault; terminating pid ");
+    crate::vga::serial_print_hex("", current as u64);
+
+    // The faulting process is not resumed. Try each runnable process until one
+    // is still alive after pending-signal delivery.
+    loop {
+        process::schedule_next();
+        let next = process::get_current_pid();
+        if next == 0 {
+            loop {
+                core::arch::asm!("cli", "hlt", options(nostack));
+            }
+        }
+        crate::signal::deliver_pending(next);
+        let state = match (*table).get_mut(next) {
+            Some(p) if p.state != process::ProcessState::Terminated => {
+                p.state = process::ProcessState::Running;
+                Some((p.registers, p.cr3, p.kernel_stack_top, p.io_port_ranges, p.io_port_range_count))
+            }
+            _ => None,
+        };
+        if let Some((regs, cr3, kernel_stack_top, io_ranges, io_range_count)) = state {
+            // Page-fault frames include the error word at slot 15. The assembly
+            // discards it after restoring GP registers, so the iret frame starts
+            // at slot 16 instead of timer_entry's slot 15.
+            *frame.add(14) = regs.rax;
+            *frame.add(11) = regs.rbx;
+            *frame.add(13) = regs.rcx;
+            *frame.add(12) = regs.rdx;
+            *frame.add(9) = regs.rsi;
+            *frame.add(8) = regs.rdi;
+            *frame.add(10) = regs.rbp;
+            *frame.add(19) = regs.rsp;
+            *frame.add(7) = regs.r8;
+            *frame.add(6) = regs.r9;
+            *frame.add(5) = regs.r10;
+            *frame.add(4) = regs.r11;
+            *frame.add(3) = regs.r12;
+            *frame.add(2) = regs.r13;
+            *frame.add(1) = regs.r14;
+            *frame.add(0) = regs.r15;
+            *frame.add(16) = regs.rip;
+            *frame.add(17) = 0x1B; // ring-3 code selector
+            *frame.add(18) = regs.rflags;
+            *frame.add(20) = 0x23; // ring-3 data selector
+            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+            crate::tss::TSS.set_rsp0(kernel_stack_top);
+            crate::tss::TSS.set_io_port_ranges(&io_ranges[..io_range_count]);
+            crate::tss::CURRENT_KERNEL_RSP = kernel_stack_top;
+            return;
+        }
+        if let Some(p) = (*table).get_mut(next) {
+            p.state = process::ProcessState::Terminated;
         }
     }
 }
@@ -1514,6 +1427,12 @@ pub unsafe fn init_idt() {
     let kbd_addr = &keyboard_entry as *const u8 as u64;
     let kbd_entry_idt = IdtEntry::new(kbd_addr, 0x08);
     idt.add(0x21).write(kbd_entry_idt);
+
+    // Vector 0x0E: page fault. User faults are isolated to the current process;
+    // write-protection faults may be resolved by the COW handler.
+    let pf_addr = &pf_entry as *const u8 as u64;
+    let pf_idt_entry = IdtEntry::new(pf_addr, 0x08);
+    idt.add(0x0E).write(pf_idt_entry);
 
     // Vector 0x0D: #GP (General Protection Fault) — diagnostic
     let gp_addr = &gp_entry as *const u8 as u64;

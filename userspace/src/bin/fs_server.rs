@@ -13,7 +13,7 @@
 
 use userspace::block_driver::{read_sector, SECTOR_SIZE};
 use userspace::fs::Fat16;
-use userspace::{vga_write, syscall0, syscall_nr};
+use userspace::{ipc_recv, vga_write, syscall0, syscall_nr, IpcMessage, MSG_STORAGE_CONFIG};
 
 /// Print a byte string one character at a time via the VGA/serial forwarder.
 fn print(s: &[u8]) {
@@ -52,6 +52,26 @@ fn print_hex(b: u8) {
 #[no_mangle]
 pub extern "C" fn main() -> ! {
     unsafe {
+        // The kernel boot code is a tiny resource manager: it discovers BAR0,
+        // grants this process those ports via the TSS bitmap, and maps a
+        // physically contiguous DMA queue at block_driver::DMA_QUEUE_VADDR.
+        // The virtio protocol itself is implemented here in user space.
+        let mut config: IpcMessage = core::mem::zeroed();
+        let received = ipc_recv(&mut config as *mut IpcMessage as usize);
+        if received <= 0 || config.msg_type != MSG_STORAGE_CONFIG {
+            print(b"No storage-device resources were granted by the kernel.\n");
+            idle();
+        }
+        let io_base = u16::from_le_bytes([config.data[0], config.data[1]]);
+        let queue_phys = u64::from_le_bytes([
+            config.data[2], config.data[3], config.data[4], config.data[5],
+            config.data[6], config.data[7], config.data[8], config.data[9],
+        ]);
+        if !userspace::block_driver::init(io_base, queue_phys) {
+            print(b"VirtIO-blk initialization failed.\n");
+            idle();
+        }
+
         print(b"=== fs_server: FAT16 smoke test ===\n");
 
         // Load sector 0 (the boot sector / BPB).

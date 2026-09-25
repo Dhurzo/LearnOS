@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the LearnOS user-space interrupt server as a non-PIE ET_EXEC loaded at
-# 0x400000, so the kernel can embed it and load it at boot via `load_elf`.
+# 0x10000000, so the kernel can embed it and load it at boot via `load_elf`.
 #
 # Usage:
 #   ./build.sh [release] [--out DIR]
@@ -25,7 +25,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN="interrupt_server"
-RELEASE=""
+RELEASE=0
 OUT_DIR=""
 positional=()
 args=("$@")
@@ -38,7 +38,14 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   fi
 done
 BIN="interrupt_server"
-[[ "${positional[0]:-}" == "release" ]] && RELEASE=" --release"
+[[ "${positional[0]:-}" == "release" ]] && RELEASE=1
+
+CARGO_PROFILE=debug
+CARGO_RELEASE_ARGS=()
+if [[ "$RELEASE" == "1" ]]; then
+  CARGO_PROFILE=release
+  CARGO_RELEASE_ARGS=(--release)
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -53,12 +60,11 @@ unset CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
     --manifest-path "$HERE/Cargo.toml" \
     --bin "$BIN" \
     --target x86_64-unknown-none \
-    --config "build.rustflags=[\"-C\",\"link-arg=-Ttext=0x400000\",\"-C\",\"link-arg=-no-pie\",\"-C\",\"link-arg=-e\",\"-C\",\"link-arg=_start\"]" \
-    $RELEASE
+    --config "build.rustflags=[\"-C\",\"link-arg=--image-base=0x10000000\",\"-C\",\"link-arg=-no-pie\",\"-C\",\"link-arg=-e\",\"-C\",\"link-arg=_start\"]" \
+    "${CARGO_RELEASE_ARGS[@]}"
 )
 
-OUT="$(ls "$HERE"/target/x86_64-unknown-none/${RELEASE:+release}debug/deps/$BIN-* 2>/dev/null | grep -vE '\.(d|o)$' | head -1)"
-[[ -z "$OUT" ]] && OUT="$HERE/target/x86_64-unknown-none/${RELEASE:+release}debug/deps/$BIN"
+OUT="$HERE/target/x86_64-unknown-none/$CARGO_PROFILE/$BIN"
 
 if [[ -n "$OUT_DIR" ]]; then
   mkdir -p "$OUT_DIR"

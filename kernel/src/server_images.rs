@@ -2,7 +2,7 @@
 //!
 //! Each LearnOS server (`vga`, `keyboard`, `init`, `shell`) used to be a Rust
 //! function compiled *into* the kernel image. They are now standalone user-space
-//! programs that each produce their own ET_EXEC ELF at load base `0x400000`.
+//! programs that each produce their own ET_EXEC ELF at load base `0x10000000`.
 //!
 //! The kernel build script (`build.rs`) compiles those images into
 //! `$OUT_DIR/server_elfs/<name>.elf` and generates the byte-array constants seen

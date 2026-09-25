@@ -36,11 +36,12 @@ pvh_start:
     mov eax, offset page_table_l4
     mov cr3, eax
     mov eax, cr4
-    or eax, 0x20
+    or eax, 0x30                 /* CR4.PAE | CR4.PSE for 64-bit + 2 MiB pages */
     mov cr4, eax
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 0x00000100
+    /* Enable long mode and NX support (EFER.LME=bit 8, EFER.NXE=bit 11). */
+    or eax, 0x00000900
     wrmsr
     mov eax, cr0
     or eax, 0x80000001
@@ -113,31 +114,29 @@ gdt64_ptr:
      */
 .align 4096
 page_table_l4:
-    .quad page_table_l3 + 0x007
+    /* The bootstrap page tables are kernel-only: user access is granted later
+     * by the per-process address spaces, page by page. */
+    .quad page_table_l3 + 0x003
     .fill 511, 8, 0
 
 .align 4096
 page_table_l3:
-    .quad page_table_l2 + 0x007
+    .quad page_table_l2 + 0x003
     .fill 511, 8, 0
 
 .align 4096
 page_table_l2:
-    // Map first 1GB (512 entries * 2MB each)
-    // NOTE: We use 0x087 (Present | Writable | User | Large) so user-space
-    // programs can execute from these pages when we drop to ring 3.
-    // In a production kernel, user code would live on separate pages with
-    // the User bit set selectively. For this educational microkernel, we
-    // set it broadly and tighten it in T5 (per-process page tables).
-    .quad 0x0000000000000087      // 0x00000000 - 0x200000
-    .quad 0x0000000002000087      // 0x0200000 - 0x400000
-    .quad 0x0000000004000087      // 0x0400000 - 0x600000
-    .quad 0x0000000006000087      // 0x0600000 - 0x800000
-    .quad 0x0000000008000087      // 0x0800000 - 0xA00000
-    .quad 0x000000000A000087      // 0x0A00000 - 0xC00000
-    .quad 0x000000000C000087      // 0x0C00000 - 0xE00000
-    .quad 0x000000000E000087      // 0x0E00000 - 0x1000000
-    .fill 504, 8, 0
+    /* Keep a supervisor-only identity map of the QEMU reference RAM. Rust
+     * touches page tables and allocated physical frames through these addresses
+     * during early boot. The process page tables install the same supervisor
+     * map; user mappings live at separate virtual addresses above this window.
+     * 0x083 = Present | Writable | 2 MiB page (not User). */
+    .set boot_pd_index, 0
+    .rept 64                         /* 64 * 2 MiB = 128 MiB */
+        .quad (boot_pd_index * 0x200000) | 0x083
+        .set boot_pd_index, boot_pd_index + 1
+    .endr
+    .fill 448, 8, 0
 
     /*
      * =========================================================================

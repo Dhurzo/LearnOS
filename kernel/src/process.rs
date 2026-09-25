@@ -100,6 +100,8 @@ use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// User PID pool size (max concurrent user processes)
 pub const USER_PIDS_COUNT: usize = 16;
+/// Maximum number of separately granted port ranges held by one process.
+pub const MAX_IO_PORT_RANGES: usize = 8;
 
 /// Slot tracking: tracks which PIDs are in use
 pub static mut USER_PID_POOL: [u16; USER_PIDS_COUNT] = [0; USER_PIDS_COUNT];
@@ -265,6 +267,10 @@ pub struct Process {
     // Phase 4 — Capability-based IPC
     /// Bitmap of capabilities this process holds (bit N = has capability N).
     pub capabilities: u64,
+    /// Exact hardware I/O-port ranges granted to this process. The TSS I/O
+    /// bitmap is rebuilt from this list whenever the scheduler switches tasks.
+    pub io_port_ranges: [crate::tss::IoPortRange; MAX_IO_PORT_RANGES],
+    pub io_port_range_count: usize,
 }
 
 /// ============================================================================
@@ -342,6 +348,8 @@ impl Process {
             signal_handlers: [None; 64],
             deadline: 0,
             capabilities: 0,
+            io_port_ranges: [crate::tss::IoPortRange::EMPTY; MAX_IO_PORT_RANGES],
+            io_port_range_count: 0,
         };
         // Phase 3 regression fix: grant the baseline set of user capabilities so
         // that generic IPC works. The capability model is dead code unless
@@ -384,6 +392,26 @@ impl Process {
                 crate::capability::cap_id::DRIVER_SEND,
             );
         }
+    }
+
+    /// Grant a process one narrow contiguous I/O-port range. This method is
+    /// kernel-only: user processes cannot edit the PCB or TSS bitmap directly.
+    pub fn grant_io_ports(&mut self, base: u16, len: u16) -> bool {
+        if len == 0 || (base as u32) + (len as u32) > 0x1_0000 {
+            return false;
+        }
+        if self.io_port_ranges[..self.io_port_range_count]
+            .iter()
+            .any(|range| range.base == base && range.len == len)
+        {
+            return true;
+        }
+        if self.io_port_range_count >= MAX_IO_PORT_RANGES {
+            return false;
+        }
+        self.io_port_ranges[self.io_port_range_count] = crate::tss::IoPortRange { base, len };
+        self.io_port_range_count += 1;
+        true
     }
 
     /// Push a message into this process's IPC queue.
@@ -489,37 +517,43 @@ impl ProcessTable {
     ///
     /// The new process's PID, or None if table is full
     pub fn spawn(&mut self, entry: u64, name: &'static str) -> Option<Pid> {
-        // Don't overflow PIDs
         if self.next_pid == 0 {
             return None;
         }
-
         let pid = self.next_pid;
-        self.next_pid = self.next_pid.wrapping_add(1);
+        let slot_idx = self.processes.iter().position(Option::is_none)?;
 
-        // Find empty slot and create process
-        self.processes.iter_mut().find(|p| p.is_none()).map(|slot| {
-            // 1. Allocate a physical frame for the user code and copy it
-            let code_frame = paging::alloc_frame();
-            unsafe {
-                core::ptr::copy_nonoverlapping(entry as *const u8, code_frame as *mut u8, 4096);
+        // Build a private address space before publishing a process-table slot.
+        let code_frame = paging::alloc_frame();
+        if code_frame == 0 {
+            return None;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(entry as *const u8, code_frame as *mut u8, 4096); }
+
+        let cr3 = match paging::create_address_space(Some(code_frame)) {
+            Some(cr3) => cr3,
+            None => {
+                paging::free_frame(code_frame);
+                return None;
             }
+        };
+        if !paging::map_user_stack(cr3) {
+            unsafe { paging::free_user_address_space(cr3); }
+            return None;
+        }
+        let kstack_frame = paging::alloc_frame();
+        if kstack_frame == 0 {
+            unsafe { paging::free_user_address_space(cr3); }
+            return None;
+        }
 
-            // 2. Create per-process page tables with the code mapped at 0x400000
-            let cr3 = paging::create_address_space(Some(code_frame));
-
-            // 3. Allocate per-process kernel stack (4KB)
-            let kstack_frame = paging::alloc_frame();
-            let kernel_stack_top = kstack_frame + 4096;
-
-            // 4. Create the process with user-space entry point
-            *slot = Some(Process::new(pid, paging::USER_VADDR_START, name));
-            let p = slot.as_mut().unwrap();
-            p.cr3 = cr3;
-            p.kernel_stack_top = kernel_stack_top;
-            p.init_registers();
-            pid
-        })
+        let mut process = Process::new(pid, paging::USER_VADDR_START, name);
+        process.cr3 = cr3;
+        process.kernel_stack_top = kstack_frame + paging::PAGE_SIZE;
+        process.init_registers();
+        self.processes[slot_idx] = Some(process);
+        self.next_pid = self.next_pid.wrapping_add(1);
+        Some(pid)
     }
 
     /// ============================================================================
@@ -530,39 +564,45 @@ impl ProcessTable {
     /// `elf_bytes` are the ET_EXEC bytes produced by the userspace build and
     /// embedded via `crate::server_images::<NAME>_ELF`. A fresh page table with
     /// only kernel mappings is created, then [`crate::elf::load_elf`] maps the ELF's
-    /// LOAD segments at their virtual addresses (0x400000) into that space. Registers
-    /// are reset so execution begins at the ELF entry point — mirroring
-    /// [`ProcessTable::load_elf_into_process`]. This gives every server an isolated
-    /// address space with its own page tables, identity-mapped kernel code, and a user
-    /// stack, loaded from a separately-compiled image rather than the kernel image.
+    /// LOAD segments at their user virtual addresses into that space. Registers
+    /// are reset so execution begins at the ELF entry point. This gives every
+    /// server an isolated
+    /// address space with a supervisor-only kernel identity map, private user stack,
+    /// and separately compiled code rather than inline kernel functions.
     ///
     /// Returns the new PID, or `None` if no slot is free or the image fails to load.
     pub fn spawn_from_elf(&mut self, name: &'static str, elf_bytes: &[u8]) -> Option<Pid> {
+        if self.next_pid == 0 {
+            return None;
+        }
         let pid = self.next_pid;
-        self.next_pid = self.next_pid.wrapping_add(1);
+        let slot_idx = self.processes.iter().position(Option::is_none)?;
 
-        // Find an empty slot and create the process with an EMPTY address space
-        // (kernel mappings only — no user code pre-mapped, since load_elf fills it).
-        let slot = self.processes.iter_mut().find(|p| p.is_none())?;
-        let cr3 = paging::create_address_space(None);
+        // Start with supervisor mappings only. The ELF loader will add user PT_LOADs.
+        let cr3 = paging::create_address_space(None)?;
+        if !paging::map_user_stack(cr3) {
+            unsafe { paging::free_user_address_space(cr3); }
+            return None;
+        }
 
-        // Allocate per-process kernel stack (4KB)
-        let kstack_frame = paging::alloc_frame();
-        let kernel_stack_top = kstack_frame + 4096;
-
-        *slot = Some(Process::new(pid, paging::USER_VADDR_START, name));
-        let p = slot.as_mut().unwrap();
-        p.cr3 = cr3;
-        p.kernel_stack_top = kernel_stack_top;
-
-        // Map the ELF LOAD segments into this process's page table.
-        let result = match unsafe { crate::elf::load_elf(elf_bytes, p.cr3) } {
-            Ok(r) => r,
-            Err(_) => return None,
+        let result = match unsafe { crate::elf::load_elf(elf_bytes, cr3) } {
+            Ok(result) => result,
+            Err(_) => {
+                unsafe { paging::free_user_address_space(cr3); }
+                return None;
+            }
         };
 
+        // Allocate a dedicated supervisor stack. The identity window maps this
+        // frame in every process as U=0, so ring 3 cannot use it.
+        let kstack_frame = paging::alloc_frame();
+        if kstack_frame == 0 {
+            unsafe { paging::free_user_address_space(cr3); }
+            return None;
+        }
+
         // Map the physical VGA text buffer (0xB8000) into this process's address
-        // space at VGA_BUFFER_VADDR (0x600000). Every freshly-spawned server gets
+        // space at the dedicated user alias. Every freshly-spawned server gets
         // this device mapping so it can write to the screen directly via
         // `VGA_BUFFER_VADDR as *mut u8` when the ABI requires it (e.g. the VGA
         // server). The page is USER_ACCESS | CACHE_DISABLE because VGA text memory
@@ -570,23 +610,33 @@ impl ProcessTable {
         // every spawned process (vga/keyboard/init/shell) has a coherent screen
         // buffer — what main.rs used to do per-server at boot before phase-2's
         // runtime loading path existed.
-        unsafe {
+        let vga_mapped = unsafe {
             crate::paging::map_phys_page(
-                p.cr3,
+                cr3,
                 crate::paging::VGA_BUFFER_VADDR,
                 crate::paging::VGA_PHYS_ADDR,
                 crate::paging::page_flags::PRESENT
                     | crate::paging::page_flags::WRITABLE
                     | crate::paging::page_flags::USER_ACCESS
-                    | crate::paging::page_flags::CACHE_DISABLE,
-            );
+                    | crate::paging::page_flags::CACHE_DISABLE
+                    | crate::paging::page_flags::EXECUTABLE_DISABLE,
+            )
+        };
+        if !vga_mapped {
+            paging::free_frame(kstack_frame);
+            unsafe { paging::free_user_address_space(cr3); }
+            return None;
         }
 
         // Reset registers so execution starts at the ELF entry point.
-        p.entry_point = result.entry;
-        p.registers = ProcessRegisters::default();
-        p.registers.rsp = result.stack_top;
-        p.registers.rip = result.entry;
+        let mut process = Process::new(pid, result.entry, name);
+        process.cr3 = cr3;
+        process.kernel_stack_top = kstack_frame + paging::PAGE_SIZE;
+        process.registers = ProcessRegisters::default();
+        process.registers.rsp = result.stack_top;
+        process.registers.rip = result.entry;
+        self.processes[slot_idx] = Some(process);
+        self.next_pid = self.next_pid.wrapping_add(1);
         Some(pid)
     }
 
@@ -608,6 +658,26 @@ impl ProcessTable {
             .iter_mut()
             .find(|p| p.as_ref().map(|p| p.pid) == Some(pid))
             .and_then(|p| p.as_mut())
+    }
+
+    /// Find the first READY process after `current` in circular slot order.
+    /// Keeping the cursor relative to the current slot is what makes round
+    /// robin fair; always scanning from slot zero would starve later processes.
+    fn next_ready_pid(&self, current: Pid) -> Option<Pid> {
+        let current_slot = self
+            .processes
+            .iter()
+            .position(|slot| slot.as_ref().map(|p| p.pid) == Some(current))
+            .unwrap_or(MAX_PROCESSES - 1);
+        for step in 1..=MAX_PROCESSES {
+            let index = (current_slot + step) % MAX_PROCESSES;
+            if let Some(p) = self.processes[index].as_ref() {
+                if p.pid != current && p.state == ProcessState::Ready {
+                    return Some(p.pid);
+                }
+            }
+        }
+        None
     }
 
     /// ============================================================================
@@ -685,108 +755,6 @@ impl ProcessTable {
         Some(child_pid)
     }
 
-    // =========================================================================
-    // exec_builtin — Phase 2: Replace process image with a built-in program
-    // =========================================================================
-    ///
-    /// Unmaps the current user pages, allocates a fresh code frame,
-    /// copies the given entry-point code into it, and resets the stack.
-    pub fn exec_builtin(&mut self, pid: Pid, entry: u64, name: &'static str) -> bool {
-        let proc = match self.get_mut(pid) {
-            Some(p) => p,
-            None => return false,
-        };
-        // Unmap old user pages
-        unsafe {
-            paging::munmap_range(proc.cr3, paging::USER_VADDR_LOAD, 0x100000);
-        }
-        // Allocate new code frame and copy entry code
-        let code_frame = paging::alloc_frame();
-        if code_frame == 0 {
-            return false;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(entry as *const u8, code_frame as *mut u8, 4096);
-        }
-        // Remap code at 0x400000
-        unsafe {
-            paging::map_phys_page(
-                proc.cr3,
-                paging::USER_VADDR_LOAD,
-                code_frame,
-                paging::PTE_USER,
-            );
-        }
-        // Reset registers
-        proc.entry_point = entry;
-        proc.registers = ProcessRegisters::default();
-        proc.registers.rsp = paging::USER_STACK_VADDR;
-        proc.registers.rip = entry;
-        proc.name = name;
-        true
-    }
-
-    // =========================================================================
-    // load_elf_into_process — Phase 3: Load an ELF file from the embedded
-    // filesystem and replace the process image with it.
-    // =========================================================================
-    ///
-    /// Opens an ELF binary from the embedded filesystem by path, reads it
-    /// into a kernel buffer, parses and maps its LOAD segments via
-    /// `elf::load_elf`, then resets registers so execution starts at
-    /// the ELF entry point.
-    ///
-    /// Returns `true` on success, `false` if the file was not found,
-    /// is not a valid ELF, or memory allocation fails.
-    pub fn load_elf_into_process(&mut self, pid: Pid, path: &str) -> bool {
-        // 1. Open file in the embedded filesystem
-        let fd = match crate::filesystem::open(pid, path) {
-            Some(fd) => fd,
-            None => return false,
-        };
-
-        // 2. Get file size (cap at 64 KiB for our kernel buffer)
-        let size = match crate::filesystem::file_size(pid, fd) {
-            Some(s) => s,
-            None => {
-                crate::filesystem::close(pid, fd);
-                return false;
-            }
-        };
-        let max_size = size.min(65536);
-
-        // 3. Read entire file into a static kernel buffer
-        let mut buf = [0u8; 65536];
-        let n = match crate::filesystem::read_all(pid, fd, &mut buf[..max_size]) {
-            Some(n) => n,
-            None => {
-                crate::filesystem::close(pid, fd);
-                return false;
-            }
-        };
-
-        // 4. Close the file (we have the data in our buffer now)
-        crate::filesystem::close(pid, fd);
-
-        // 5. Load ELF segments into the process's address space
-        let proc = match self.get_mut(pid) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let result = match unsafe { crate::elf::load_elf(&buf[..n], proc.cr3) } {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        // 6. Reset registers like exec_builtin does
-        proc.entry_point = result.entry;
-        proc.registers = ProcessRegisters::default();
-        proc.registers.rsp = result.stack_top;
-        proc.registers.rip = result.entry;
-
-        true
-    }
 }
 
 /// ============================================================================
@@ -847,16 +815,8 @@ pub fn schedule_next() {
             }
         }
 
-        // 2. Find next READY process
-        let mut next_pid: Pid = 0;
-        for i in 0..MAX_PROCESSES {
-            if let Some(ref p) = pt.processes[i] {
-                if p.state == ProcessState::Ready && p.pid != current {
-                    next_pid = p.pid;
-                    break;
-                }
-            }
-        }
+        // 2. Find the next runnable process after the current table slot.
+        let next_pid = pt.next_ready_pid(current).unwrap_or(0);
 
         // 3. Switch to next process
         if next_pid != 0 {
@@ -865,9 +825,15 @@ pub fn schedule_next() {
                 set_current_pid(next_pid);
             }
         } else if current != 0 {
-            // No other READY, keep current running
+            // No alternate runnable process. Keep the current process only if
+            // it is still runnable (a BLOCKED or TERMINATED process must not be
+            // silently resurrected just because the run queue is empty).
             if let Some(p) = pt.get_mut(current) {
-                p.state = ProcessState::Running;
+                if p.state == ProcessState::Ready {
+                    p.state = ProcessState::Running;
+                } else {
+                    set_current_pid(0);
+                }
             }
         }
     }
@@ -986,10 +952,15 @@ fn schedule_user(entry: u64, stack: u64, cr3: u64, kernel_stack_top: u64) {
     unsafe {
         crate::tss::TSS.set_rsp0(kernel_stack_top);
         crate::tss::CURRENT_KERNEL_RSP = kernel_stack_top;
+        let pid = get_current_pid();
+        let table = core::ptr::addr_of!(PROCESS_TABLE);
+        if let Some(p) = (*table).get(pid) {
+            crate::tss::TSS.set_io_port_ranges(&p.io_port_ranges[..p.io_port_range_count]);
+        }
 
         core::arch::asm!(
-            // Load per-process page tables so the CPU uses the correct
-            // code mapping at 0x400000 and user stack at 0xFFF000.
+            // Load per-process page tables so the CPU uses this process's ELF
+            // mapping at USER_VADDR_LOAD and its private high-canonical stack.
             "mov cr3, {cr3}",
 
             // Build iretq frame on stack (reverse order):
@@ -1012,5 +983,35 @@ fn schedule_user(entry: u64, stack: u64, cr3: u64, kernel_stack_top: u64) {
             rflags = in(reg) 0x202u64,   // IF=1, reserved bits set
             options(noreturn)
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn round_robin_visits_ready_slots_after_current_and_wraps() {
+        let mut table = ProcessTable::new();
+        for (slot, pid) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            table.processes[slot] = Some(Process::new(pid, USER_VADDR_START, "test"));
+        }
+
+        assert_eq!(table.next_ready_pid(1), Some(2));
+        assert_eq!(table.next_ready_pid(2), Some(3));
+        assert_eq!(table.next_ready_pid(4), Some(1)); // wrap to slot zero
+    }
+
+    #[test]
+    fn round_robin_skips_blocked_and_terminated_processes() {
+        let mut table = ProcessTable::new();
+        table.processes[0] = Some(Process::new(1, USER_VADDR_START, "current"));
+        table.processes[1] = Some(Process::new(2, USER_VADDR_START, "blocked"));
+        table.processes[2] = Some(Process::new(3, USER_VADDR_START, "dead"));
+        table.processes[3] = Some(Process::new(4, USER_VADDR_START, "ready"));
+        table.processes[1].as_mut().unwrap().state = ProcessState::Blocked;
+        table.processes[2].as_mut().unwrap().state = ProcessState::Terminated;
+
+        assert_eq!(table.next_ready_pid(1), Some(4));
     }
 }

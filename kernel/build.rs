@@ -2,7 +2,7 @@
 //!
 //! Responsibilities:
 //!   1. Build each user-space server image (`vga`, `keyboard`, `init`, `shell`)
-//!      as an ET_EXEC ELF at load base `0x400000` via `userspace/build.sh`.
+//!      as an ET_EXEC ELF at load base `0x10000000` via `userspace/build.sh`.
 //!   2. Build the user-space interrupt server (the IRQ router) via
 //!      `interrupt_server/build.sh`.
 //!   3. Copy the resulting ELFs into `$OUT_DIR/server_elfs/<name>.elf`.
@@ -18,6 +18,64 @@ use std::process::Command;
 
 /// User-space server images the kernel must embed and load at boot.
 const SERVERS: &[&str] = &["vga", "keyboard", "init", "shell", "fs_server"];
+
+/// Reject stale/mislinked ELFs at build time, before the kernel embeds an image
+/// whose PT_LOAD segments overlap the supervisor identity map or VGA alias.
+fn validate_user_elf(path: &std::path::Path, image_name: &str) {
+    const USER_BASE: u64 = 0x1000_0000;
+    const USER_END: u64 = 0x2000_0000;
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!("failed to read user ELF `{image_name}` ({}): {e}", path.display())
+    });
+    let u16_at = |off: usize| -> u16 {
+        u16::from_le_bytes(bytes[off..off + 2].try_into().expect("checked ELF field"))
+    };
+    let u32_at = |off: usize| -> u32 {
+        u32::from_le_bytes(bytes[off..off + 4].try_into().expect("checked ELF field"))
+    };
+    let u64_at = |off: usize| -> u64 {
+        u64::from_le_bytes(bytes[off..off + 8].try_into().expect("checked ELF field"))
+    };
+
+    assert!(bytes.len() >= 64, "user ELF `{image_name}` is truncated");
+    assert_eq!(&bytes[..4], b"\x7fELF", "user ELF `{image_name}` has bad magic");
+    assert_eq!(bytes[4], 2, "user ELF `{image_name}` is not ELF64");
+    assert_eq!(bytes[5], 1, "user ELF `{image_name}` is not little-endian");
+    assert_eq!(u16_at(16), 2, "user ELF `{image_name}` is not ET_EXEC");
+    assert_eq!(u16_at(18), 0x3E, "user ELF `{image_name}` is not x86-64");
+
+    let entry = u64_at(24);
+    let phoff = usize::try_from(u64_at(32)).expect("ELF program-header offset fits usize");
+    let phentsize = u16_at(54) as usize;
+    let phnum = u16_at(56) as usize;
+    assert!(phentsize >= 56 && phnum > 0, "user ELF `{image_name}` has no program headers");
+    let phend = phoff
+        .checked_add(phentsize.checked_mul(phnum).expect("program-header table size overflow"))
+        .expect("program-header table end overflow");
+    assert!(phend <= bytes.len(), "user ELF `{image_name}` program headers are truncated");
+
+    let mut has_load = false;
+    let mut entry_is_executable = false;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        if u32_at(off) != 1 { // PT_LOAD
+            continue;
+        }
+        has_load = true;
+        let flags = u32_at(off + 4);
+        let vaddr = u64_at(off + 16);
+        let filesz = u64_at(off + 32);
+        let memsz = u64_at(off + 40);
+        let end = vaddr.checked_add(memsz).expect("PT_LOAD virtual range overflow");
+        assert!(filesz <= memsz, "user ELF `{image_name}` has filesz > memsz");
+        assert!(vaddr >= USER_BASE && end <= USER_END, "user ELF `{image_name}` PT_LOAD [{vaddr:#x}, {end:#x}) is outside its user window");
+        if flags & 1 != 0 && entry >= vaddr && entry < end {
+            entry_is_executable = true;
+        }
+    }
+    assert!(has_load, "user ELF `{image_name}` contains no PT_LOAD segments");
+    assert!(entry_is_executable, "user ELF `{image_name}` entry {entry:#x} is not in an executable PT_LOAD");
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -36,11 +94,23 @@ fn main() {
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../userspace/Cargo.toml").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../userspace/src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../userspace/.cargo/config.toml").display()
+    );
     // Rebuild when the interrupt server's own tooling changes.
     println!("cargo:rerun-if-changed={}", interrupt_build_sh.display());
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../interrupt_server/Cargo.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../interrupt_server/src").display()
     );
 
     let mut generated = String::new();
@@ -65,10 +135,11 @@ fn main() {
         if !elf.exists() {
             panic!("expected ELF not produced for `{}`: {}", name, elf.display());
         }
+        validate_user_elf(&elf, name);
 
         let upper = name.to_uppercase();
         generated.push_str(&format!(
-            "/// `{name}` user-space server image (ET_EXEC @ 0x400000).\n\
+            "/// `{name}` user-space server image (ET_EXEC @ 0x10000000).\n\
              pub const {upper}_ELF: &[u8] =\n\
              include_bytes!(concat!(env!(\"OUT_DIR\"), \"/server_elfs/{name}.elf\"));\n\n",
         ));
@@ -95,9 +166,10 @@ fn main() {
             isr_elf.display()
         );
     }
+    validate_user_elf(&isr_elf, "interrupt_server");
 
     generated.push_str(
-        "/// User-space interrupt server image (ET_EXEC @ 0x400000).\n\
+        "/// User-space interrupt server image (ET_EXEC @ 0x10000000).\n\
          ///\n\
          /// Loaded at boot when `INTERRUPT_SERVER_PID != 0`; the kernel routes\n\
          /// hardware IRQs to it instead of delivering them directly.\n\

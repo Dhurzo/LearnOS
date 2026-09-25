@@ -14,6 +14,7 @@ VERBOSE="false"
 GUI_MODE="true"
 INTERACTIVE_MODE="false"
 DEBUG_MODE="false"
+DISK_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
         --timeout)
             TIMEOUT="$2"
             TIMEOUT_SET="true"
+            shift 2
+            ;;
+        --disk)
+            DISK_IMAGE="$2"
             shift 2
             ;;
         --gui)
@@ -53,6 +58,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --nographic    Use serial console (no GUI window)"
             echo "  --interactive  Run in foreground without timeout"
             echo "  --timeout N    Set timeout to N seconds (default: 10)"
+            echo "  --disk IMAGE   Attach a raw image as legacy virtio-blk (e.g. FAT16)"
             echo "  -h, --help     Show this help message"
             exit 0
             ;;
@@ -77,6 +83,18 @@ fi
 if [ ! -f "$KERNEL" ]; then
     echo "Kernel not found, building..."
     ./build.sh
+fi
+
+DISK_ARGS=()
+if [ -n "$DISK_IMAGE" ]; then
+    if [ ! -f "$DISK_IMAGE" ]; then
+        echo "ERROR: disk image not found: $DISK_IMAGE"
+        exit 1
+    fi
+    # Force the transitional legacy interface this educational user-space
+    # driver implements: BAR0 I/O ports + a PFN-based virtqueue.
+    DISK_ARGS+=( -drive "if=none,id=learnos_disk,file=$DISK_IMAGE,format=raw" )
+    DISK_ARGS+=( -device "virtio-blk-pci,drive=learnos_disk,disable-modern=on" )
 fi
 
 if [ ! -f "$KERNEL" ]; then
@@ -106,13 +124,15 @@ if [ "$DEBUG_MODE" = "true" ]; then
     qemu-system-x86_64 \
         -kernel "$KERNEL" \
         -m 128M -machine pc-q35-9.2,accel=kvm:tcg -cpu host \
-        -d guest_errors,unimp,int -nographic
+        -d guest_errors,unimp,int -nographic \
+        "${DISK_ARGS[@]}"
     exit 0
 fi
 
 # QEMU 10.x dropped -kernel for ELF on the default q35 machine type.
 # Use pc-q35-9.2 (pre-10.0) which still supports -kernel with PVH.
 QEMU_CMD=(qemu-system-x86_64 -kernel "$KERNEL" -m 128M -machine pc-q35-9.2,accel=kvm:tcg -cpu host -vga std)
+QEMU_CMD+=( "${DISK_ARGS[@]}" )
 if [ "$GUI_MODE" != "true" ]; then
     QEMU_CMD+=( -nographic )
 fi

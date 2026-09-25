@@ -27,8 +27,26 @@
 
 use core::arch::asm;
 
-/// Size of a 64-bit TSS in bytes (see Intel SDM Vol. 3, Ch. 7)
-const TSS_SIZE: usize = 104;
+/// Fixed architectural 64-bit TSS prefix (Intel SDM Vol. 3, Ch. 7).
+const TSS_FIXED_SIZE: usize = 104;
+/// One bit for each of the 65,536 x86 I/O ports.
+const IO_BITMAP_BYTES: usize = 65536 / 8;
+/// The processor may read one byte beyond the bitmap for multi-byte I/O, so
+/// the TSS ends with the required all-ones terminator byte.
+const TSS_SIZE: usize = TSS_FIXED_SIZE + IO_BITMAP_BYTES + 1;
+const IO_BITMAP_OFFSET: usize = TSS_FIXED_SIZE;
+
+/// A kernel-granted contiguous range of x86 I/O ports. No user process gets
+/// broad IOPL=3; the TSS bitmap enables only the ports in its resource grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoPortRange {
+    pub base: u16,
+    pub len: u16,
+}
+
+impl IoPortRange {
+    pub const EMPTY: Self = Self { base: 0, len: 0 };
+}
 
 /// A 64-bit Task State Segment.
 ///
@@ -76,6 +94,31 @@ impl TaskStateSegment {
     pub fn set_iopb(&mut self, offset: u16) {
         let bytes = offset.to_le_bytes();
         self.data[102..104].copy_from_slice(&bytes);
+    }
+
+    /// Replace the active task's I/O permissions. x86 bitmap semantics are
+    /// inverted: bit 1 denies I/O, bit 0 permits it. Reset to deny-all before
+    /// applying this process's explicit device grants on every context switch.
+    pub fn set_io_port_ranges(&mut self, ranges: &[IoPortRange]) {
+        let bitmap_end = IO_BITMAP_OFFSET + IO_BITMAP_BYTES;
+        self.data[IO_BITMAP_OFFSET..=bitmap_end].fill(0xFF);
+        for range in ranges {
+            if range.len == 0 {
+                continue;
+            }
+            let start = range.base as u32;
+            let end = start + range.len as u32;
+            if end > 0x1_0000 {
+                continue;
+            }
+            for port in start..end {
+                let byte_index = IO_BITMAP_OFFSET + (port as usize / 8);
+                let bit = 1u8 << (port % 8);
+                self.data[byte_index] &= !bit;
+            }
+        }
+        // Keep the terminator denied even if a malformed range was supplied.
+        self.data[bitmap_end] = 0xFF;
     }
 
     /// Set IST1 (Interrupt Stack Table entry 1).
@@ -254,7 +297,8 @@ pub unsafe fn init() {
     TSS.set_kernel_stack(stack_top);
 
     // 2. Set IOPB = TSS size to disable user I/O port access
-    TSS.set_iopb(TSS_SIZE as u16);
+    TSS.set_iopb(IO_BITMAP_OFFSET as u16);
+    TSS.set_io_port_ranges(&[]); // deny all user I/O until a device is granted
 
     // 3. Set IST1 to the double-fault stack top
     let df_top = (&DOUBLE_FAULT_STACK as *const DoubleFaultStack as u64) + 4096;
@@ -274,4 +318,31 @@ pub unsafe fn init() {
 
     // 6. Load the task register (selector = 0x28 = GDT entry 5)
     asm!("ltr {0:x}", in(reg) 0x28u16, options(nostack));
+}
+
+#[cfg(test)]
+mod io_bitmap_tests {
+    use super::*;
+
+    #[test]
+    fn io_bitmap_denies_by_default_and_grants_only_requested_ports() {
+        let mut tss = TaskStateSegment::new();
+        tss.set_io_port_ranges(&[]);
+        assert_eq!(tss.data[IO_BITMAP_OFFSET], 0xFF);
+
+        tss.set_io_port_ranges(&[IoPortRange { base: 0x0CF8, len: 8 }]);
+        let first = IO_BITMAP_OFFSET + 0x0CF8 / 8;
+        assert_eq!(tss.data[first], 0x00); // all 8 config ports explicitly granted
+        assert_eq!(tss.data[first - 1], 0xFF);
+        assert_eq!(tss.data[first + 1], 0xFF);
+        assert_eq!(tss.data[IO_BITMAP_OFFSET + IO_BITMAP_BYTES], 0xFF); // terminator
+    }
+
+    #[test]
+    fn invalid_port_range_is_not_granted() {
+        let mut tss = TaskStateSegment::new();
+        tss.set_io_port_ranges(&[IoPortRange { base: 0xFFFE, len: 4 }]);
+        assert_eq!(tss.data[IO_BITMAP_OFFSET + IO_BITMAP_BYTES - 1], 0xFF);
+        assert_eq!(tss.data[IO_BITMAP_OFFSET + IO_BITMAP_BYTES], 0xFF);
+    }
 }
