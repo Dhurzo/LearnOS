@@ -1,0 +1,11 @@
+[package]
+name = "signal_state"
+version = "0.1.0"
+edition = "2021"
+
+description = "Pure, platform-independent signal-wait state-machine logic for LearnOS."
+
+# Host-testable: uses only `core` (no std), so it compiles both on the host
+# (during `cargo test`) and inside the no_std kernel binary. See lib.rs.
+
+[dependencies]

@@ -96,13 +96,35 @@
 //! =============================================================================
 
 use crate::paging::{self, MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START, USER_VADDR_END};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// User PID pool size (max concurrent user processes)
 pub const USER_PIDS_COUNT: usize = 16;
 
 /// Slot tracking: tracks which PIDs are in use
 pub static mut USER_PID_POOL: [u16; USER_PIDS_COUNT] = [0; USER_PIDS_COUNT];
+
+/// Global monotonic kernel clock, incremented once per PIT timer tick (~100/sec).
+///
+/// This is the only "wall clock" the microkernel has. Signal-wait deadlines
+/// (`sys_wait_signal`) are expressed relative to it: a waiter records
+/// `deadline = current_tick() + timeout_ticks` and is woken by the timer once
+/// `current_tick() >= deadline`. Kept as an atomic so the increment in timer
+/// context is well-defined even if other code ever reads it.
+pub static mut KERNEL_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Return the current kernel tick (the monotonic clock used for signal deadlines).
+pub fn current_tick() -> u64 {
+    unsafe { KERNEL_TICK.load(Ordering::Relaxed) }
+}
+
+/// Advance the kernel clock by one tick. Called from `timer_tick` on every PIT
+/// interrupt so that deadline-based wakeup has a monotonically increasing clock.
+pub fn increment_tick() {
+    unsafe {
+        KERNEL_TICK.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Allocate a user PID from the pool (linear scan for simplicity).
 /// Returns 0 if pool is full.
@@ -235,6 +257,10 @@ pub struct Process {
     pub signal_pending: u64,
     /// Registered signal handlers (one per signal number, max 64).
     pub signal_handlers: [Option<u64>; 64],
+    /// Monotonic-tick deadline at which a `Blocked_for_signal` waiter is woken.
+    /// `0` means "no deadline" (wait indefinitely until a signal arrives). Set by
+    /// `sys_wait_signal`; checked each timer tick in `check_deadlines`.
+    pub deadline: u64,
 
     // Phase 4 — Capability-based IPC
     /// Bitmap of capabilities this process holds (bit N = has capability N).
@@ -291,7 +317,7 @@ impl Process {
     ///
     /// New Process with default registers and memory regions
     pub fn new(pid: Pid, entry: u64, name: &'static str) -> Self {
-        Self {
+        let mut p = Self {
             pid,
             state: ProcessState::Ready,
             entry_point: entry,
@@ -314,7 +340,49 @@ impl Process {
             ipc_tail: 0,
             signal_pending: 0,
             signal_handlers: [None; 64],
+            deadline: 0,
             capabilities: 0,
+        };
+        // Phase 3 regression fix: grant the baseline set of user capabilities so
+        // that generic IPC works. The capability model is dead code unless
+        // something grants these bits — `check_ipc_send` rejects any `ipc_send`
+        // whose sender lacks the destination's endpoint capability, and every
+        // process previously started with `capabilities == 0`. That is exactly
+        // what killed keyboard input once IRQ routing was turned on: the ISR's
+        // hop to the keyboard handler (dst PID 3 -> DRIVER_SEND) and the
+        // keyboard's own self-registration with the ISR (dst PID 2 ->
+        // KEYBOARD_SEND) both went through `check_ipc_send` and were dropped.
+        p.grant_initial_caps();
+        p
+    }
+
+    /// Grant the standard set of user capabilities this process needs for normal IPC.
+    ///
+    /// The capability model only functions if something grants these bits —
+    /// `check_ipc_send` rejects any `ipc_send` whose sender lacks the destination's
+    /// endpoint capability. We grant a baseline at creation (matching the design in
+    /// `capability.rs`, where caps are "granted at process creation") so every
+    /// legitimate process can talk to the well-known servers (VGA, keyboard) and to
+    /// generic drivers/handlers, and register IRQ handlers with the interrupt server.
+    /// FORK/EXEC are intentionally left ungranted: they gate privileged operations.
+    fn grant_initial_caps(&mut self) {
+        unsafe {
+            crate::capability::grant(
+                &mut self.capabilities,
+                crate::capability::cap_id::VGA_SEND,
+            );
+            crate::capability::grant(
+                &mut self.capabilities,
+                crate::capability::cap_id::KEYBOARD_SEND,
+            );
+            crate::capability::grant(
+                &mut self.capabilities,
+                crate::capability::cap_id::INTERRUPT_SEND,
+            );
+            crate::capability::grant(
+                &mut self.capabilities,
+                crate::capability::cap_id::DRIVER_SEND,
+            );
         }
     }
 
@@ -438,7 +506,7 @@ impl ProcessTable {
             }
 
             // 2. Create per-process page tables with the code mapped at 0x400000
-            let cr3 = paging::create_address_space(code_frame);
+            let cr3 = paging::create_address_space(Some(code_frame));
 
             // 3. Allocate per-process kernel stack (4KB)
             let kstack_frame = paging::alloc_frame();
@@ -452,6 +520,74 @@ impl ProcessTable {
             p.init_registers();
             pid
         })
+    }
+
+    /// ============================================================================
+    /// spawn_from_elf — load a server from an embedded ELF image (phase-2 runtime loading)
+    /// ============================================================================
+    ///
+    /// `name` is the process name registered in the table (e.g. "vga-server").
+    /// `elf_bytes` are the ET_EXEC bytes produced by the userspace build and
+    /// embedded via `crate::server_images::<NAME>_ELF`. A fresh page table with
+    /// only kernel mappings is created, then [`crate::elf::load_elf`] maps the ELF's
+    /// LOAD segments at their virtual addresses (0x400000) into that space. Registers
+    /// are reset so execution begins at the ELF entry point — mirroring
+    /// [`ProcessTable::load_elf_into_process`]. This gives every server an isolated
+    /// address space with its own page tables, identity-mapped kernel code, and a user
+    /// stack, loaded from a separately-compiled image rather than the kernel image.
+    ///
+    /// Returns the new PID, or `None` if no slot is free or the image fails to load.
+    pub fn spawn_from_elf(&mut self, name: &'static str, elf_bytes: &[u8]) -> Option<Pid> {
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.wrapping_add(1);
+
+        // Find an empty slot and create the process with an EMPTY address space
+        // (kernel mappings only — no user code pre-mapped, since load_elf fills it).
+        let slot = self.processes.iter_mut().find(|p| p.is_none())?;
+        let cr3 = paging::create_address_space(None);
+
+        // Allocate per-process kernel stack (4KB)
+        let kstack_frame = paging::alloc_frame();
+        let kernel_stack_top = kstack_frame + 4096;
+
+        *slot = Some(Process::new(pid, paging::USER_VADDR_START, name));
+        let p = slot.as_mut().unwrap();
+        p.cr3 = cr3;
+        p.kernel_stack_top = kernel_stack_top;
+
+        // Map the ELF LOAD segments into this process's page table.
+        let result = match unsafe { crate::elf::load_elf(elf_bytes, p.cr3) } {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+
+        // Map the physical VGA text buffer (0xB8000) into this process's address
+        // space at VGA_BUFFER_VADDR (0x600000). Every freshly-spawned server gets
+        // this device mapping so it can write to the screen directly via
+        // `VGA_BUFFER_VADDR as *mut u8` when the ABI requires it (e.g. the VGA
+        // server). The page is USER_ACCESS | CACHE_DISABLE because VGA text memory
+        // is device memory, not RAM. Centralising this in spawn_from_elf guarantees
+        // every spawned process (vga/keyboard/init/shell) has a coherent screen
+        // buffer — what main.rs used to do per-server at boot before phase-2's
+        // runtime loading path existed.
+        unsafe {
+            crate::paging::map_phys_page(
+                p.cr3,
+                crate::paging::VGA_BUFFER_VADDR,
+                crate::paging::VGA_PHYS_ADDR,
+                crate::paging::page_flags::PRESENT
+                    | crate::paging::page_flags::WRITABLE
+                    | crate::paging::page_flags::USER_ACCESS
+                    | crate::paging::page_flags::CACHE_DISABLE,
+            );
+        }
+
+        // Reset registers so execution starts at the ELF entry point.
+        p.entry_point = result.entry;
+        p.registers = ProcessRegisters::default();
+        p.registers.rsp = result.stack_top;
+        p.registers.rip = result.entry;
+        Some(pid)
     }
 
     /// ============================================================================
@@ -732,6 +868,51 @@ pub fn schedule_next() {
             // No other READY, keep current running
             if let Some(p) = pt.get_mut(current) {
                 p.state = ProcessState::Running;
+            }
+        }
+    }
+}
+
+/// ============================================================================
+/// Signal-Wait Deadline Helpers (Phase 4a — real blocking/wakeup)
+/// ============================================================================
+///
+/// The pure deadline math lives in the `signal_state` crate (host-tested with no
+/// bare-metal glue). These wrappers add the platform-specific guards:
+/// `deadline_expired` is a single-process predicate; `check_deadlines` applies it
+/// across the whole process table once per timer tick.
+
+/// Return true if `p` is currently blocked waiting for a signal AND its deadline
+/// has elapsed (`now >= deadline`, with a non-zero deadline set). A zero deadline
+/// means "wait indefinitely" and never expires on its own.
+///
+/// The pure deadline math lives in the `signal_state` crate (host-tested); this
+/// wrapper adds the platform-specific guard that only real signal-waiters — those
+/// in state=Blocked with a non-zero deadline — qualify. An I/O-blocked process
+/// also uses Blocked but never sets a deadline, so it is never woken by the timer.
+pub fn deadline_expired(p: &Process, now: u64) -> bool {
+    p.state == ProcessState::Blocked && signal_state::deadline_expired(p.deadline, now)
+}
+
+/// Wake every process in the table whose signal-wait deadline has elapsed.
+///
+/// Called from `timer_tick` after advancing the clock and before `schedule_next`,
+/// so that freshly-woken processes are immediately eligible to be scheduled.
+/// This is the coarse-grained, timer-driven wakeup: because the kernel returns
+/// from wait syscalls via `sysretq` (see syscall.rs), a waiter only truly blocks
+/// across ticks when the timer re-schedules it; here we flip its state back to
+/// READY so the next round-robin pass can run it.
+pub fn check_deadlines() {
+    let now = current_tick();
+    unsafe {
+        let pt = &mut PROCESS_TABLE;
+        for i in 0..MAX_PROCESSES {
+            if let Some(p) = pt.processes[i].as_mut() {
+                if deadline_expired(p, now) {
+                    p.state = ProcessState::Ready;
+                    // Deadline elapsed: a pending signal (if any) is now deliverable.
+                    p.deadline = 0;
+                }
             }
         }
     }

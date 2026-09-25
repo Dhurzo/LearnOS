@@ -71,7 +71,9 @@ pub unsafe fn send_signal(pid: u16, sig: usize) {
     if let Some(proc) = table.get_mut(pid) {
         proc.signal_pending |= 1u64 << sig;
 
-        // If process was blocked, wake it up
+        // If process was blocked, wake it up. Signal-waiters set state=Blocked and
+        // a non-zero deadline (see sys_wait_signal); any pending signal makes them
+        // runnable again immediately.
         if proc.state == crate::process::ProcessState::Blocked {
             proc.state = crate::process::ProcessState::Ready;
         }
@@ -125,24 +127,32 @@ pub unsafe fn deliver_pending(pid: u16) -> bool {
                 // and redirect execution to the signal handler.
                 // The handler can call SYS_WAIT_SIGNAL to clear the signal.
                 let old_rsp = proc.registers.rsp;
-                // Push old RIP onto user stack
+                // Push old RIP onto user stack (8-byte slot just below RSP).
                 let new_rsp = old_rsp.wrapping_sub(8);
-                // Write old RIP to user stack via the process's page table
                 let old_rip = proc.registers.rip;
-                // For safety, we write to the stack through the mapped page
-                // (the stack is at USER_STACK_VADDR - size, and we know it's mapped)
-                if new_rsp > crate::paging::USER_STACK_VADDR - 4096 * 8 {
-                    let page_offset = new_rsp as usize % 4096;
-                    let page_base = new_rsp - page_offset as u64;
-                    // Map the stack page if needed (it should already be mapped)
-                    // Write the return address directly
-                    unsafe {
-                        let stack_slot = new_rsp as *mut u64;
-                        core::ptr::write(stack_slot, old_rip);
-                    }
-                    // Set up the handler frame
+                // Write old RIP through the process's OWN page tables (cr3),
+                // translating the user virtual address to its physical frame.
+                // This is essential: `new_rsp` is a USER vaddr, and writing to
+                // it as a raw pointer from ring 0 would hit the kernel's
+                // identity-mapped frame instead of the real user stack, so the
+                // handler would later pop garbage RIP on return.
+                // `to_le_bytes()` writes the same 8 bytes that a native u64 push
+                // would (x86-64 is little-endian), but now routed through the
+                // process's page tables.
+                let delivered = unsafe {
+                    crate::paging::write_user_memory(proc.cr3, new_rsp, &old_rip.to_le_bytes())
+                };
+                if delivered.is_ok() {
+                    // Frame set up correctly: the handler runs on return and its
+                    // `iretq` pops the old RIP we just stored.
                     proc.registers.rsp = new_rsp;
                     proc.registers.rip = handler_addr;
+                } else {
+                    // Target page is unmapped or not writable — treat as a fatal
+                    // fault for THIS process rather than crashing the kernel
+                    // (no panic). The bit was already cleared above.
+                    crate::vga::serial_print("signal: bad user stack addr\n");
+                    proc.state = crate::process::ProcessState::Terminated;
                 }
             } else {
                 // No handler registered — use default action

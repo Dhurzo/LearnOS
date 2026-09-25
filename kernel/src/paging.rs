@@ -398,6 +398,95 @@ pub unsafe fn zero_pt_frame(table_phys: u64) {
 }
 
 // =============================================================================
+// USER MEMORY ACCESS VIA PAGE TABLES (Phase 5 — Signal Delivery)
+// =============================================================================
+
+/// Mask that strips attribute bits from a page-table entry, leaving the physical
+/// address of the next lower table (page-aligned for 4KB/2MB tables).
+const ENTRY_PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// Resolve a user virtual address to its physical frame by walking the four
+/// level page table rooted at `pml4_phys`.
+///
+/// Returns `Ok((phys_of_vaddr, page_size))` where `phys_of_vaddr` is the exact
+/// physical address backing `vaddr` and `page_size` is 0x1000 (4KB), 0x2000
+/// (2MB) or 0x40000 (1GB). Every entry on the path must be PRESENT and WRITABLE;
+/// otherwise returns `Err(())`.
+///
+/// # Safety
+///
+/// `pml4_phys` must point to a valid PML4 frame. The caller owns the walk.
+pub unsafe fn resolve_user_page(pml4_phys: u64, vaddr: u64) -> Result<(u64, usize), ()> {
+    // Level 1: PML4 -> PDPT
+    let pml4e = read_pt_entry(pml4_phys, ((vaddr >> 39) & 0x1ff) as usize);
+    if pml4e & page_flags::PRESENT == 0 || pml4e & page_flags::WRITABLE == 0 {
+        return Err(());
+    }
+    let pdpt_phys = pml4e & ENTRY_PHYS_MASK;
+
+    // Level 2: PDPT -> PD (or a 1GB huge page)
+    let pdpte = read_pt_entry(pdpt_phys, ((vaddr >> 30) & 0x1ff) as usize);
+    if pdpte & page_flags::PRESENT == 0 || pdpte & page_flags::WRITABLE == 0 {
+        return Err(());
+    }
+    if pdpte & page_flags::LARGE != 0 {
+        let base = pdpte & !0x3FFF_FFFF; // 1GB-aligned
+        return Ok((base + (vaddr & 0x3FFF_FFFF), 0x40000));
+    }
+
+    // Level 3: PD -> PT (or a 2MB huge page)
+    let pd_phys = pdpte & ENTRY_PHYS_MASK;
+    let pde = read_pt_entry(pd_phys, ((vaddr >> 21) & 0x1ff) as usize);
+    if pde & page_flags::PRESENT == 0 || pde & page_flags::WRITABLE == 0 {
+        return Err(());
+    }
+    if pde & page_flags::LARGE != 0 {
+        let base = pde & !0x1FFF; // 2MB-aligned
+        return Ok((base + (vaddr & 0x1FFF), 0x2000));
+    }
+
+    // Level 4: PT -> 4KB page. The leaf lives in the *page table* pointed to by the
+    // PD entry `pde`, so derive `pt_phys` from it — reading from `pd_phys` here would
+    // index the wrong table and always fail for real 4KB mappings.
+    let pt_phys = pde & ENTRY_PHYS_MASK;
+    let pte = read_pt_entry(pt_phys, ((vaddr >> 12) & 0x1ff) as usize);
+    if pte & page_flags::PRESENT == 0 || pte & page_flags::WRITABLE == 0 {
+        return Err(());
+    }
+    let base = pte & !0xFFF; // 4KB-aligned
+    Ok((base + (vaddr & 0xFFF), 0x1000))
+}
+
+/// Write `data` to user virtual address `vaddr`, translating through the page
+/// tables rooted at `pml4_phys`. The write lands in the physical frame, which
+/// the kernel reaches via its identity map (the same trick used by COW fault
+/// handling). Writes that span or cross page boundaries are handled
+/// transparently.
+///
+/// Returns `Ok(())` iff every byte was written; returns `Err(())` if any touched
+/// page is unmapped or not writable. Callers must treat `Err` as a fault and
+/// handle it gracefully — this function itself never faults or panics.
+pub unsafe fn write_user_memory(pml4_phys: u64, mut vaddr: u64, data: &[u8]) -> Result<(), ()> {
+    let mut i = 0;
+    while i < data.len() {
+        let (phys, size) = match resolve_user_page(pml4_phys, vaddr) {
+            Ok(v) => v,
+            Err(()) => return Err(()),
+        };
+        let off_in_page = (vaddr & (size as u64 - 1)) as usize;
+        let can_write = size - off_in_page;
+        let n = core::cmp::min(can_write, data.len() - i);
+        let dst = phys as *mut u8;
+        for k in 0..n {
+            core::ptr::write_unaligned(dst.add(k), data[i + k]);
+        }
+        i += n;
+        vaddr += n as u64;
+    }
+    Ok(())
+}
+
+// =============================================================================
 // COPY-ON-WRITE (Phase 2 — Process Creation)
 // =============================================================================
 
@@ -564,7 +653,7 @@ pub unsafe fn handle_cow_fault(cr3: u64, fault_addr: u64) -> bool {
 ///   `code_phys`: physical address of user code to map at 0x400000
 ///
 /// Returns the physical address of the new PML4 (to be loaded into CR3).
-pub fn create_address_space(code_phys: u64) -> u64 {
+pub fn create_address_space(code_phys: Option<u64>) -> u64 {
     unsafe {
         // === Level 4: PML4 ===
         let pml4 = alloc_zeroed_frame();
@@ -602,9 +691,14 @@ pub fn create_address_space(code_phys: u64) -> u64 {
 
         // --- PD[2]: user code region 0x400000-0x5FFFFF → 4KB PT ---
         let pt_code = alloc_zeroed_frame();
-        // Map code_phys at virtual 0x400000 (PT index 0 covers 0x400000-0x400FFF)
+        // Map code_phys at virtual 0x400000 (PT index 0 covers 0x400000-0x400FFF).
+        // When `code_phys` is None the page table is left empty so a caller can
+        // populate it later via `map_phys_page`/`elf::load_elf` — used by
+        // `spawn_from_elf`, which loads an ELF image into its own LOAD segments.
         let code_flags = page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER_ACCESS;
-        write_pt_entry(pt_code, 0, (code_phys & 0x000FFFFFFFFFF000) | code_flags);
+        if let Some(frame) = code_phys {
+            write_pt_entry(pt_code, 0, (frame & 0x000FFFFFFFFFF000) | code_flags);
+        }
         // PD[2] points to PT (no LARGE bit — this is a regular 4KB-page directory)
         write_pt_entry(
             pd,
@@ -840,4 +934,182 @@ pub fn is_valid_user_vaddr(addr: u64) -> bool {
 pub fn is_valid_user_buffer(addr: u64, size: usize) -> bool {
     let end = addr.saturating_add(size as u64);
     is_valid_user_vaddr(addr) && is_valid_user_vaddr(end.saturating_sub(1))
+}
+
+// =============================================================================
+// HOST UNIT TESTS (Phase 5 — Signal Delivery page-walk/writer)
+//
+// These run under `cargo test` on the host (see main.rs gating of no_std /
+// no_main). They build fake four-level page tables in page-aligned stack slots
+// and verify that resolve_user_page + write_user_memory translate user virtual
+// addresses through cr3 exactly as the real kernel would.
+// =============================================================================
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use std::alloc::{alloc_zeroed, Layout};
+
+    /// Allocate one page-aligned (4096), zeroed frame from the host allocator.
+    /// Unlike stack-allocated `Slot` arrays these addresses are stable and always
+    /// mapped/writable, so they survive the deeper calls inside `link_4kb` without
+    /// landing in guard territory near the live stack pointer (which caused the
+    /// lowest slot to read back as zero).
+    unsafe fn alloc_frame() -> *mut u8 {
+        let layout = Layout::from_size_align(4096, 4096).expect("valid 4KB layout");
+        let ptr = alloc_zeroed(layout);
+        assert!(!ptr.is_null(), "frame allocation failed");
+        ptr
+    }
+
+    /// Link `virt` through all four page-table levels (PML4 -> PDPT -> PD -> PT) to a
+    /// 4KB leaf frame, mirroring what the real kernel does when it maps user stack.
+    unsafe fn link_4kb(pml4: u64, pdpt: u64, pd: u64, pt: u64, virt: u64, leaf_phys: u64) {
+        write_pt_entry(
+            pml4, ((virt >> 39) & 0x1ff) as usize,
+            pdpt | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        write_pt_entry(
+            pdpt, ((virt >> 30) & 0x1ff) as usize,
+            pd | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        write_pt_entry(
+            pd, ((virt >> 21) & 0x1ff) as usize,
+            pt | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+        write_pt_entry(
+            pt, ((virt >> 12) & 0x1ff) as usize,
+            leaf_phys | page_flags::PRESENT | page_flags::WRITABLE,
+        );
+    }
+
+    #[test]
+    fn resolve_resolves_user_vaddr_to_physical_frame() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf = alloc_frame();
+            link_4kb(
+                pml4 as u64, pdpt as u64, pd as u64, pt as u64,
+                USER_STACK_VADDR, leaf as u64,
+            );
+
+            let (phys, size) = resolve_user_page(pml4 as u64, USER_STACK_VADDR).unwrap();
+            assert_eq!(size, 0x1000);
+            // Physical address must be the backing frame plus vaddr's in-page offset.
+            assert_eq!(phys, leaf as u64 + (USER_STACK_VADDR & 0xfff));
+        }
+    }
+
+    #[test]
+    fn write_user_memory_writes_through_to_physical_frame() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf = alloc_frame();
+            link_4kb(
+                pml4 as u64, pdpt as u64, pd as u64, pt as u64,
+                USER_STACK_VADDR, leaf as u64,
+            );
+
+            let payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+            write_user_memory(pml4 as u64, USER_STACK_VADDR, &payload).expect("write should succeed");
+
+            // The bytes must have landed in the backing frame at vaddr's offset.
+            let off = (USER_STACK_VADDR & 0xfff) as usize;
+            for (i, b) in payload.iter().enumerate() {
+                assert_eq!(*(leaf.add(off + i)), *b, "byte {} mismatch", i);
+            }
+        }
+    }
+
+    #[test]
+    fn write_user_memory_handles_cross_page_boundary() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf_a = alloc_frame();
+            let leaf_b = alloc_frame();
+
+            // Both pages live under pdpt[0] -> pd[0] -> pt, but map to different
+            // physical leaves via distinct PT entries (entry 1 and entry 2).
+            write_pt_entry(pml4 as u64, 0, pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pdpt as u64, 0, pd as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pd as u64, 0, pt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pt as u64, (0x1000 >> 12) & 0x1ff, leaf_a as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pt as u64, (0x2000 >> 12) & 0x1ff, leaf_b as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+
+            // 9 bytes starting at 0x1FF8: 8 land in page A (..0x1FFF), 1 spills
+            // into page B (0x2000).
+            let payload = [7u8; 9];
+            write_user_memory(pml4 as u64, 0x1FF8, &payload).expect("cross-page write should succeed");
+
+            let off_a = (0x1FF8 & 0xfff) as usize;
+            for (k, b) in payload[..8].iter().enumerate() {
+                assert_eq!(*(leaf_a.add(off_a + k)), *b, "page A byte {} mismatch", k);
+            }
+            assert_eq!(*(leaf_b.add(0)), payload[8], "page B spill mismatch");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_unmapped_at_pml4_level() {
+        unsafe {
+            let pml4 = alloc_frame();
+            // Address whose PML4 index (1) is unmapped.
+            let bad = 0x0080_0000_0000;
+            assert_eq!((bad >> 39) & 0x1ff, 1);
+            assert!(resolve_user_page(pml4 as u64, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_unmapped_leaf() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf = alloc_frame();
+            // Map only vaddr 0x1000; query a different page (0x2000) in same PT.
+            link_4kb(
+                pml4 as u64, pdpt as u64, pd as u64, pt as u64,
+                0x1000, leaf as u64,
+            );
+            assert!(resolve_user_page(pml4 as u64, 0x2000).is_err()); // PT[2] is zero -> not present
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_present_but_not_writable() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let pdpt = alloc_frame();
+            let pd = alloc_frame();
+            let pt = alloc_frame();
+            let leaf = alloc_frame();
+            // Present but NOT writable (read-only page) -> must be rejected so we
+            // never write to a read-only mapping.
+            write_pt_entry(pml4 as u64, 0, pdpt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pdpt as u64, 0, pd as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pd as u64, 0, pt as u64 | page_flags::PRESENT | page_flags::WRITABLE);
+            write_pt_entry(pt as u64, (0x1000 >> 12) & 0x1ff, leaf as u64 | page_flags::PRESENT);
+            assert!(resolve_user_page(pml4 as u64, 0x1000).is_err());
+        }
+    }
+
+    #[test]
+    fn write_user_memory_returns_err_on_bad_address() {
+        unsafe {
+            let pml4 = alloc_frame();
+            let bad = 0x0080_0000_0000; // unmapped at PML4 level
+            assert!(write_user_memory(pml4 as u64, bad, &[1u8; 8]).is_err());
+        }
+    }
 }

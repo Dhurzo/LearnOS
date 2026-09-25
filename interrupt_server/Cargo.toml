@@ -3,4 +3,11 @@ name = "interrupt_server"
 version = "0.1.0"
 edition = "2021"
 
+# Sibling crate that depends on the Phase 1 user-space runtime library. It links
+# against `userspace` for the syscall/IPC wrappers, the `IpcMessage` layout, the
+# `_start` trampoline and the panic handler — exactly like the other servers in
+# `userspace/src/bin/*`. Kept out of the root workspace (like `userspace`) so the
+# kernel's linker script from the root `.cargo/config.toml` never leaks into its
+# link step.
 [dependencies]
+userspace = { path = "../userspace" }

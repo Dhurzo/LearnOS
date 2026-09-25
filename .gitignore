@@ -33,3 +33,12 @@ Thumbs.db
 .gsd
 .gsd-id
 tmp/
+
+# PhaseFlow planning noise: agent-generated plans and phase specs.
+# These are regenerated locally by the planner agents on every run and would
+# only create merge conflicts if versioned. The durable project memory
+# (decisions, milestones, review reports) lives in DECISIONS.md,
+# MILESTONES.md, CURRENT_PLAN.md and outputs/ instead, which ARE tracked.
+plan.md
+PLAN.MD
+phases/

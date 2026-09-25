@@ -1,0 +1,48 @@
+# userspace — runtime for LearnOS microkernel user programs.
+#
+# This package is intentionally EXCLUDED from the root workspace (see the
+# root Cargo.toml `exclude` list). The root workspace injects the kernel's
+# linker script (`-Tkernel/src/linker.ld`) via `.cargo/config.toml`, which we
+# must NOT inherit: user programs are ET_EXEC images loaded at 0x400000, not
+# the kernel PVH image. Each target inherits its own flags from this crate's
+# `.cargo/config.toml`.
+
+[package]
+name = "userspace"
+version = "0.1.0"
+edition = "2021"
+
+# The runtime library that every user program links against.
+[lib]
+name = "userspace"
+path = "src/lib.rs"
+
+# Example programs. Each is a standalone bin target defining its own
+# `extern "C" fn main() -> !`; the runtime's `_start` calls it.
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+# Phase 2 microkernel servers: each compiles to its own ET_EXEC image at 0x400000,
+# embedded into the kernel by `kernel/build.rs`, and loaded at boot via
+# `elf::load_elf` instead of being linked as inline kernel functions.
+[[bin]]
+name = "vga"
+path = "src/bin/vga.rs"
+
+[[bin]]
+name = "keyboard"
+path = "src/bin/keyboard.rs"
+
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+
+# Phase 6 storage smoke-test server: parses FAT16 over BLOCK_READ/BLOCK_WRITE.
+[[bin]]
+name = "fs_server"
+path = "src/bin/fs_server.rs"

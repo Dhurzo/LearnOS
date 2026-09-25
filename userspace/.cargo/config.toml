@@ -1,0 +1,17 @@
+# Per-crate build config for userspace programs.
+#
+# NOTE: this crate is excluded from the root workspace so that cargo does NOT
+# inherit the root `.cargo/config.toml`, which hard-kernels the kernel's
+# linker script (`-Tkernel/src/linker.ld`). User images must instead be plain
+# ET_EXEC binaries loaded at 0x400000.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Ttext=0x400000",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-e _start",
+    "-C", "codegen-units=1",
+]

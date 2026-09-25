@@ -27,7 +27,7 @@ static mut IRQ_HANDLERS: [[u16; HANDLERS_PER_IRQ]; BASE_IRQ_COUNT] =
     [[0; HANDLERS_PER_IRQ]; BASE_IRQ_COUNT];
 
 /// PID of the user-space interrupt server process (0 means not yet registered).
-static mut INTERRUPT_SERVER_PID: u16 = 0;
+pub static mut INTERRUPT_SERVER_PID: u16 = 0;
 
 // =============================================================================
 // Initialisation

@@ -126,7 +126,7 @@ fn serial_write(byte: u8) {
 }
 
 /// Print a UTF-8 string to the serial port via `serial_write`.
-fn serial_print(s: &str) {
+pub fn serial_print(s: &str) {
     for byte in s.bytes() {
         serial_write(byte);
     }

@@ -6,3 +6,4 @@ edition = "2021"
 description = "A minimal x86_64 kernel written in Rust with PVH support"
 
 [dependencies]
+signal_state = { path = "../signal_state" }

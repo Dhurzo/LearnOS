@@ -44,6 +44,7 @@
 //! timer_entry assembly saves all GP registers, calls
 //! timer_save_and_switch to save/restore process state, then iretq.
 
+use crate::interrupt_server::INTERRUPT_SERVER_PID;
 use crate::process;
 use crate::vga;
 
@@ -92,6 +93,9 @@ pub mod syscall_nr {
     pub const FS_READ: usize = 21;
     pub const CLOSE: usize = 22;
     pub const READDIR: usize = 23;
+    // Phase 6 — Raw block access (userspace filesystem lives here)
+    pub const BLOCK_READ: usize = 24;
+    pub const BLOCK_WRITE: usize = 25;
 }
 
 /// The legacy INT 0x80 vector is defined here for reference.
@@ -176,6 +180,9 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::FS_READ] = Some(sys_fs_read);
     table.handlers[syscall_nr::CLOSE] = Some(sys_close);
     table.handlers[syscall_nr::READDIR] = Some(sys_readdir);
+    // Phase 6 — Raw block access (userspace filesystem)
+    table.handlers[syscall_nr::BLOCK_READ] = Some(sys_block_read);
+    table.handlers[syscall_nr::BLOCK_WRITE] = Some(sys_block_write);
     table
 };
 
@@ -277,10 +284,12 @@ fn sys_getpid(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: u
 /// `server` selects which server to look up:
 ///   1 = VGA display server (PID 1 by convention)
 ///   2 = Keyboard input server (PID 0 by default, set via keyboard_irq_init)
+///   3 = Interrupt server / IRQ router (PID 0 when user-space routing is off)
 fn sys_get_server_pid(server: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
     match server {
         1 => unsafe { VGA_SERVER_PID as isize },
         2 => unsafe { KEYBOARD_SERVER_PID as isize },
+        3 => unsafe { INTERRUPT_SERVER_PID as isize },
         _ => -1,
     }
 }
@@ -294,6 +303,22 @@ fn is_valid_user_ptr(ptr: usize) -> bool {
     // User code is mapped at 0x400000. User stack is near 0x7FFF...
     // Anything below 0x400000 or above 0x8000000000 is not user space.
     ptr >= 0x400000 && ptr < 0x800000000
+}
+
+/// Check whether a WHOLE user buffer `[ptr, ptr + len)` lies in user space.
+///
+/// LESSON (validation scope): checking only the START pointer is not enough.
+/// A buffer starting at a valid address but extending past the user region
+/// (or wrapping around the address space via `ptr + len` overflow) would let
+/// a caller read/write kernel memory. `checked_add` turns the wraparound case
+/// into `None` instead of a wrapped address that passes the range test.
+fn is_valid_user_range(ptr: usize, len: usize) -> bool {
+    match ptr.checked_add(len) {
+        // `end` is one-past-the-last-byte; `<=` keeps the exclusive bound
+        // consistent with `is_valid_user_ptr` above.
+        Some(end) => ptr >= 0x400000 && end <= 0x800000000,
+        None => false, // wrapped around the address space: reject outright
+    }
 }
 
 /// IPC_SEND: Send a message to another process.
@@ -617,6 +642,106 @@ fn sys_readdir(buf_ptr: usize, buf_size: usize, _a3: usize, _a4: usize, _a5: usi
 }
 
 // =============================================================================
+// PHASE 6 — RAW BLOCK ACCESS SYSCALLS
+// =============================================================================
+//
+// These syscalls let user-space filesystem code read/write raw 512-byte blocks
+// through the kernel's virtio-blk driver. The kernel owns the device; all
+// filesystem logic (FAT16 parsing, directory listing, etc.) lives in user space
+// and reaches storage only via these two calls. See DECISIONS.md [Phase 6].
+
+/// BLOCK_READ: Read `count` bytes from a byte offset into the block store.
+///
+/// a1 = byte offset (into the whole device)
+/// a2 = pointer to user-space buffer
+/// a3 = number of bytes to read
+///
+/// Returns the number of bytes actually read, or -1 on failure.
+fn sys_block_read(offset: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if count == 0 {
+        return -1;
+    }
+    // Clamp FIRST, validate SECOND: the kernel staging buffer holds 4096
+    // bytes, so the kernel will never touch more than that — validate exactly
+    // the range we will actually copy to.
+    let count = count.min(4096);
+    if !is_valid_user_range(buf_ptr, count) {
+        return -1;
+    }
+    let mut kernel_buf = [0u8; 4096];
+    let read = crate::block_dev::read_bytes(offset, &mut kernel_buf[..count]);
+    if read > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                kernel_buf.as_ptr(),
+                buf_ptr as *mut u8,
+                read,
+            );
+        }
+    }
+    read as isize
+}
+
+/// BLOCK_WRITE: Write `count` bytes from a buffer to a byte offset.
+///
+/// a1 = byte offset (into the whole device)
+/// a2 = pointer to user-space buffer
+/// a3 = number of bytes to write
+///
+/// Returns the number of bytes actually written, or -1 on failure.
+fn sys_block_write(offset: usize, buf_ptr: usize, count: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if count == 0 {
+        return -1;
+    }
+    // Clamp FIRST (see sys_block_read): an earlier revision looped over the
+    // ORIGINAL `count` while the staging buffer only held 4096 bytes, so any
+    // write larger than one page copied uninitialised stack bytes to disk.
+    let count = count.min(4096);
+    if !is_valid_user_range(buf_ptr, count) {
+        return -1;
+    }
+    let mut kernel_buf = [0u8; 4096];
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf_ptr as *const u8, kernel_buf.as_mut_ptr(), count);
+    }
+    // Write in whole-block granularity (512 bytes).
+    //
+    // LESSON (read-modify-write): storage only transfers FULL blocks, but the
+    // caller may ask to write a partial range (e.g. 100 bytes in the middle of
+    // a block). An earlier revision built each block from a ZEROED buffer and
+    // copied only the caller's bytes into it — silently ZEROING the neighbour
+    // bytes that shared those blocks (data corruption on every partial write!).
+    // The correct pattern: for edge blocks that are only partly covered, READ
+    // the block first, patch the covered bytes in, then write it back. Only
+    // fully-covered blocks may skip the read.
+    let mut written = 0usize;
+    while written < count {
+        let blk_off = offset + written; // byte offset of the next byte to store
+        let block = blk_off / crate::block_dev::BLOCK_SIZE;
+        let off_in_block = blk_off % crate::block_dev::BLOCK_SIZE;
+        let chunk = (count - written).min(crate::block_dev::BLOCK_SIZE - off_in_block);
+        let full_cover = off_in_block == 0 && chunk == crate::block_dev::BLOCK_SIZE;
+        let mut buf = if full_cover {
+            [0u8; crate::block_dev::BLOCK_SIZE]
+        } else {
+            // Partial edge block: preserve the bytes we are NOT rewriting.
+            let mut b = [0u8; crate::block_dev::BLOCK_SIZE];
+            if !crate::block_dev::read_block(block, &mut b) {
+                break; // unreadable block: stop, report what we wrote so far
+            }
+            b
+        };
+        buf[off_in_block..off_in_block + chunk]
+            .copy_from_slice(&kernel_buf[written..written + chunk]);
+        if !crate::block_dev::write_block(block, &buf) {
+            break;
+        }
+        written += chunk;
+    }
+    written as isize
+}
+
+// =============================================================================
 // PHASE 4 — SYSTEM HARDENING SYSCALLS
 // =============================================================================
 
@@ -711,7 +836,17 @@ fn sys_wait_signal(timeout: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usiz
             if timeout == 0 {
                 return -1;
             }
-            // Otherwise block and wait (simplified: just yield and retry)
+            // Block until a signal arrives or the deadline elapses. Record the
+            // deadline in kernel ticks so check_deadlines() can wake us via the
+            // timer. We still return to userland via sysretq (the kernel cannot
+            // stay blocked inside a syscall without abandoning the sysretq/iretq
+            // stack discipline); the recorded deadline plus state=Blocked ensure
+            // that when we are next scheduled, either the signal is already pending
+            // or our deadline has elapsed and check_deadlines() wakes us. (The
+            // `deadline` field disambiguates a signal-wait from an I/O-block: only
+            // waiters set a non-zero deadline.) The absolute-deadline math lives in
+            // the host-tested `signal_state` crate.
+            p.deadline = signal_state::compute_deadline(process::current_tick(), timeout as u64);
             p.state = process::ProcessState::Blocked;
         }
     }
