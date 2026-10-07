@@ -124,6 +124,13 @@ pub const USER_STACK_VADDR: u64 = 0x00007FFFFFFFF000;
 /// Kept outside both the kernel identity map and the user ELF range.
 pub const VGA_BUFFER_VADDR: u64 = 0x0000000020000000;
 
+/// User heap window for `BRK` (syscall 5). The heap grows up from
+/// `USER_HEAP_START` toward `USER_HEAP_END` (exclusive); pages are mapped on
+/// demand and unmapped on shrink. It sits right after the VGA alias page and
+/// ends where the legacy DMA alias begins, so it overlaps neither.
+pub const USER_HEAP_START: u64 = 0x0000000020001000;
+pub const USER_HEAP_END: u64 = 0x0000000030000000;
+
 /// User alias for the two-page legacy virtio queue owned by the storage
 /// process. Its physical backing is passed to the device; this virtual alias
 /// is only how ring 3 fills descriptors and reads completions.
@@ -375,6 +382,20 @@ pub unsafe fn munmap_range(pml4_phys: u64, vaddr: u64, len: u64) {
     }
 }
 
+/// Invalidate one TLB entry on this CPU.
+///
+/// Required after unmapping a page from a LIVE address space (e.g. `BRK`
+/// shrink on the caller's own CR3): without it the core could keep using
+/// the freed frame through a stale translation.
+///
+/// # Safety
+///
+/// Purely local effect. The caller must ensure `addr` needs no shootdown on
+/// other cores (this kernel runs single-core scheduling).
+pub unsafe fn invlpg(addr: u64) {
+    core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags));
+}
+
 /// Free all page-table frames (PML4, PDPT, PD, PT) for a process.
 ///
 /// Walks the full 4-level tree and frees every frame that belongs to the
@@ -574,7 +595,7 @@ pub unsafe fn resolve_user_page_access(
     {
         return Err(());
     }
-    let base = pte & !0xFFF; // 4KB-aligned
+    let base = pte & ENTRY_PHYS_MASK; // 4KB-aligned, NX-safe (bit 63 cleared)
     Ok((base + (vaddr & 0xFFF), 0x1000))
 }
 

@@ -15,6 +15,34 @@
 
 use userspace::{ipc_recv, syscall0, syscall_nr, IpcMessage};
 
+/// Mirror output to COM1 serial so user-space rendering is observable from the
+/// host (`-serial mon:stdio`). The kernel initialized COM1 at boot and granted
+/// this process the serial port range via its TSS I/O bitmap — the driver owns
+/// the actual port I/O.
+fn serial_putc(b: u8) {
+    unsafe {
+        let port: u16 = 0x3F8;
+        loop {
+            let status: u8;
+            core::arch::asm!(
+                "in al, dx",
+                in("dx") port + 5,
+                out("al") status,
+                options(nostack, preserves_flags),
+            );
+            if status & 0x20 != 0 {
+                break;
+            }
+        }
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Virtual address of the VGA text buffer (mapped by the loader for this process).
 const VGA_BUFFER_VADDR: usize = 0x20000000;
 /// Standard VGA text-mode grid.
@@ -46,6 +74,7 @@ pub extern "C" fn main() -> ! {
             // data[0] = the ASCII byte to display.
             1 => {
                 let byte = msg.data[0];
+                serial_putc(byte);
                 match byte {
                     b'\n' => {
                         let row = cursor / VGA_COLS;

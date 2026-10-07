@@ -123,7 +123,12 @@ pub fn forward_irq(irq: u8, data: &[u8; 60]) {
             {
                 let mut d = [0u8; 60];
                 d[0] = irq;
-                d[1..].copy_from_slice(data);
+                // The message holds the IRQ number plus the first 59 payload
+                // bytes (60 - 1); the 60th payload byte has no room and is
+                // dropped. Slicing both sides to 59 keeps the lengths equal:
+                // a full 60-byte copy here used to panic and silently wedge
+                // the machine on the first keyboard IRQ.
+                d[1..].copy_from_slice(&data[..59]);
                 d
             },
         );

@@ -13,6 +13,8 @@
 //!   SIGIPC   4  — IPC message delivered
 //!   SIGTERM  5  — Graceful termination request
 //!   SIGCHLD  6  — Child process exited
+//!   SIGSTOP  9  — Suspend process (unschedule until SIGCONT)
+//!   SIGCONT  10 — Resume a stopped process
 
 /// Maximum number of distinct signals.
 pub const MAX_SIGNALS: usize = 64;
@@ -28,6 +30,8 @@ pub mod sig_num {
     pub const SIGCHLD: usize = 6;
     pub const SIGUSER1: usize = 7;
     pub const SIGUSER2: usize = 8;
+    pub const SIGSTOP: usize = 9;
+    pub const SIGCONT: usize = 10;
 }
 
 /// Signal action: how the process handles a signal.
@@ -37,6 +41,10 @@ pub enum SignalAction {
     Kill,
     /// Ignore the signal.
     Ignore,
+    /// Suspend the process (scheduler skips it until SIGCONT).
+    Stop,
+    /// Resume a stopped process (no-op otherwise).
+    Continue,
     /// Call the registered handler (if any), otherwise use default.
     Handler,
 }
@@ -51,6 +59,8 @@ pub fn default_action(sig: usize) -> SignalAction {
         sig_num::SIGALRM => SignalAction::Ignore,
         sig_num::SIGIPC => SignalAction::Ignore, // handled via IPC poll
         sig_num::SIGCHLD => SignalAction::Ignore,
+        sig_num::SIGSTOP => SignalAction::Stop,
+        sig_num::SIGCONT => SignalAction::Continue,
         _ => SignalAction::Kill,
     }
 }
@@ -75,6 +85,11 @@ pub unsafe fn send_signal(pid: u16, sig: usize) {
         // a non-zero deadline (see sys_wait_signal); any pending signal makes them
         // runnable again immediately.
         if proc.state == crate::process::ProcessState::Blocked {
+            proc.state = crate::process::ProcessState::Ready;
+        }
+        // A stopped process is never scheduled, so `deliver_pending` would
+        // never run for it: apply SIGCONT synchronously here instead.
+        if sig == sig_num::SIGCONT && proc.state == crate::process::ProcessState::Stopped {
             proc.state = crate::process::ProcessState::Ready;
         }
     }
@@ -119,6 +134,22 @@ pub unsafe fn deliver_pending(pid: u16) -> bool {
         }
         SignalAction::Ignore => {
             // Nothing to do; bit already cleared
+            true
+        }
+        SignalAction::Stop => {
+            // Suspend: the scheduler's `next_ready_pid` only picks Ready
+            // processes, and the resume path skips Stopped like Terminated,
+            // so this process will not run again until SIGCONT.
+            proc.state = crate::process::ProcessState::Stopped;
+            crate::vga::serial_print("signal stop\n");
+            true
+        }
+        SignalAction::Continue => {
+            // Resume a stopped process; harmless no-op otherwise.
+            if proc.state == crate::process::ProcessState::Stopped {
+                proc.state = crate::process::ProcessState::Ready;
+                crate::vga::serial_print("signal cont\n");
+            }
             true
         }
         SignalAction::Handler => {

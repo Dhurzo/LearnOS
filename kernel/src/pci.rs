@@ -8,6 +8,10 @@
 /// Port span used by the legacy virtio-blk common header and 64-bit capacity.
 pub const VIRTIO_LEGACY_IO_PORT_LEN: u16 = 0x20;
 
+/// ISA-style IDE hard-disk register ports (data port first, 8 registers).
+pub const IDE_DATA_PORT: u16 = 0x1F0;
+pub const IDE_IO_PORT_LEN: u16 = 8;
+
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;
 const VIRTIO_BLK_DEVICE_ID: u16 = 0x1001;
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;

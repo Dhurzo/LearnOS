@@ -239,7 +239,7 @@ pub fn kernel_stack_top() -> u64 {
 ///   Bits 3-0: type = 1001 (available 64-bit TSS)
 /// → 0b1000_1001 = 0x89
 
-/// Compute the TSS descriptor and write it into the GDT at entries 5 and 6.
+/// Compute the TSS descriptor and write it into the GDT at entries 6 and 7.
 ///
 /// # Safety
 ///
@@ -271,8 +271,8 @@ unsafe fn write_tss_descriptor(gdt_base: *mut u64) {
     let low = u64::from_le_bytes(desc[0..8].try_into().unwrap());
     let high = u64::from_le_bytes(desc[8..16].try_into().unwrap());
 
-    gdt_base.add(5).write(low);   // GDT entry 5 (selector 0x28)
-    gdt_base.add(6).write(high);  // GDT entry 6 (selector 0x30)
+    gdt_base.add(6).write(low);   // GDT entry 6 (selector 0x30)
+    gdt_base.add(7).write(high);  // GDT entry 7 (selector 0x38)
 }
 
 /// ============================================================================
@@ -316,8 +316,8 @@ pub unsafe fn init() {
     // 5. Write TSS descriptor into GDT
     write_tss_descriptor(gdt_base);
 
-    // 6. Load the task register (selector = 0x28 = GDT entry 5)
-    asm!("ltr {0:x}", in(reg) 0x28u16, options(nostack));
+    // 6. Load the task register (selector = 0x30 = GDT entry 6)
+    asm!("ltr {0:x}", in(reg) 0x30u16, options(nostack));
 }
 
 #[cfg(test)]

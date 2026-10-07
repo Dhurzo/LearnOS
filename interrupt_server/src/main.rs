@@ -17,7 +17,16 @@
 //! IRQs through us (`INTERRUPT_SERVER_PID != 0`) — it never tells us who handles
 //! each line.
 
-use userspace::{ipc_recv, ipc_send, IpcMessage};
+use userspace::{ipc_recv, ipc_send, vga_write, IpcMessage};
+
+/// Print a boot/probe line via the VGA server (serial mirror included).
+fn trace(s: &[u8]) {
+    unsafe {
+        for &b in s.iter() {
+            let _ = vga_write(b as usize);
+        }
+    }
+}
 
 /// IPC message types exchanged with the kernel and with handlers.
 ///
@@ -93,6 +102,7 @@ unsafe fn forward(irq: u8, payload_first: u8, handler_pid: u16) {
 #[no_mangle]
 pub extern "C" fn main() -> ! {
     let buf: [u8; 64] = [0u8; 64];
+    trace(b"ISR up\n");
     loop {
         let len = unsafe { ipc_recv(buf.as_ptr() as usize) };
         if len <= 0 {

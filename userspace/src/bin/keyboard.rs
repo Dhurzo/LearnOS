@@ -1,21 +1,116 @@
 //! PS/2 keyboard input server (Phase 2 — standalone user-space image).
 //!
-//! This server receives raw scancodes from the kernel's IRQ handler, decodes
-//! them into ASCII characters, buffers them in a ring buffer, and serves them to
-//! client processes on request.
+//! This server owns the PS/2 controller ports (0x60 data, 0x64 status) through
+//! a TSS I/O grant installed by the kernel at spawn. The kernel IRQ handler
+//! only forwards the IRQ notification — the scancode itself is drained here,
+//! from ring 3, when the notification arrives. No kernel code touches port
+//! 0x60 (phase A1 purification).
 //!
-//! Split-phase design: the kernel IRQ handler pushes scancodes asynchronously
-//! (via IPC type 3), while clients pull decoded keys on demand (type 4 → reply
-//! type 5). The ring buffer decouples the interrupt rate from the client rate,
-//! keeping the kernel minimal — all decode/buffer logic lives in user space.
+//! Split-phase design: IRQ notifications arrive asynchronously (via IPC type
+//! 3), while clients pull decoded keys on demand (type 4 → reply type 5).
+//! The ring buffer decouples the interrupt rate from the client rate.
 
 #![no_std]
 #![no_main]
 
 use userspace::{get_server_pid, ipc_recv, ipc_send, vga_write, syscall0, syscall_nr, IpcMessage};
 
+/// PS/2 controller ports owned by this server (granted by the kernel).
+const PS2_DATA_PORT: u16 = 0x60;
+const PS2_STATUS_PORT: u16 = 0x64;
+/// Status bit 0 (output-buffer-full): a scancode byte is waiting at 0x60.
+const PS2_OBF: u8 = 0x01;
+
 /// Ring buffer size for decoded key events.
 const KEY_BUF_CAPACITY: usize = 16;
+
+/// Read one byte from an I/O port (ring 3 — permitted by our TSS grant).
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nostack, preserves_flags));
+    value
+}
+
+/// Drain one scancode from the PS/2 controller.
+///
+/// Waits (bounded) for the output-buffer-full status bit, then reads the data
+/// port. Returns `None` if no byte arrives — the IRQ may have been a stray
+/// notification, and a server must never spin forever inside its slice.
+fn read_scancode() -> Option<u8> {
+    unsafe {
+        for _ in 0..10_000u32 {
+            if inb(PS2_STATUS_PORT) & PS2_OBF != 0 {
+                return Some(inb(PS2_DATA_PORT));
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+}
+
+/// Handle one drained scancode byte: buffer make-codes, echo, drop the rest.
+fn handle_scancode(
+    scancode: u8,
+    key_buf: &mut [u8; KEY_BUF_CAPACITY],
+    buf_head: &mut usize,
+    buf_tail: &mut usize,
+) {
+    // Bit 7 = 0 means "make" (key press). Ignore break codes.
+    if scancode & 0x80 != 0 {
+        return;
+    }
+    if let Some(ch) = decode_scancode(scancode) {
+        // Buffer the decoded key (drop if full).
+        let next = (*buf_tail + 1) % KEY_BUF_CAPACITY;
+        if next != *buf_head {
+            key_buf[*buf_tail] = ch;
+            *buf_tail = next;
+        }
+        // Echo the key to VGA so the user can see what they typed.
+        // The kernel forwards this via IPC to the VGA server.
+        unsafe { let _ = vga_write(ch as usize); }
+    }
+}
+
+/// Drain only bytes that are already waiting in the controller (no waiting).
+///
+/// This is cheap enough to run at the top of the server loop: if the ISR
+/// notification was dropped because the keyboard queue was full, the scancode
+/// is still sitting in the PS/2 buffer and this recovers it.
+fn drain_ready(
+    key_buf: &mut [u8; KEY_BUF_CAPACITY],
+    buf_head: &mut usize,
+    buf_tail: &mut usize,
+) {
+    unsafe {
+        for _ in 0..16 {
+            if inb(PS2_STATUS_PORT) & PS2_OBF == 0 {
+                break;
+            }
+            handle_scancode(inb(PS2_DATA_PORT), key_buf, buf_head, buf_tail)
+        }
+    }
+}
+
+/// Drain every byte currently waiting in the controller (bounded).
+///
+/// A boot-time IRQ can fire before this server registers with the ISR, so a
+/// stale byte may sit in the 1-byte buffer with no notification ever coming
+/// for it: while OBF stays set the controller raises no further IRQs and the
+/// keyboard would look dead. Draining at startup (and in bursts per
+/// notification) keeps the buffer empty so each new keystroke interrupts.
+fn drain_pending(
+    key_buf: &mut [u8; KEY_BUF_CAPACITY],
+    buf_head: &mut usize,
+    buf_tail: &mut usize,
+) {
+    for _ in 0..16 {
+        match read_scancode() {
+            Some(sc) => handle_scancode(sc, key_buf, buf_head, buf_tail),
+            None => break,
+        }
+    }
+}
 
 /// Decode a PS/2 scancode (set 1, make code only) into an ASCII character.
 ///
@@ -65,6 +160,15 @@ pub extern "C" fn main() -> ! {
     // register with, so we skip silently. When routing is on, tell the ISR that
     // this process owns IRQ 1 (the keyboard) by sending MSG_IRQ_REGISTER.
     let isr_pid = unsafe { get_server_pid(3) };
+    // Boot diagnostic (also proves this server runs): report the ISR pid.
+    // A missing line here means the keyboard server never started.
+    unsafe {
+        let _ = vga_write(b'K' as usize);
+        let _ = vga_write(b'D' as usize);
+        let _ = vga_write(b' ' as usize);
+        let _ = vga_write((b'0' + isr_pid.min(9) as u8) as usize);
+        let _ = vga_write(b'\n' as usize);
+    }
     if isr_pid > 0 {
         let my_pid = unsafe { syscall0(syscall_nr::GETPID) } as u16;
         let mut data = [0u8; 60];
@@ -74,8 +178,15 @@ pub extern "C" fn main() -> ! {
         let reg = IpcMessage::new(0, 6, data); // MSG_IRQ_REGISTER
         unsafe { let _ = ipc_send(isr_pid as usize, &reg as *const IpcMessage as usize); }
     }
+    // Drain any stale boot-time byte (see `drain_pending`) so the first real
+    // keystroke raises a fresh IRQ.
+    drain_pending(&mut key_buf, &mut buf_head, &mut buf_tail);
 
     loop {
+        // Recover any scancode that is already waiting, even if the ISR
+        // notification was dropped because this server's IPC queue was full.
+        drain_ready(&mut key_buf, &mut buf_head, &mut buf_tail);
+
         // Wait for the next IPC message.
         let mut msg: IpcMessage = unsafe { core::mem::zeroed() };
         let ret = unsafe { ipc_recv(&mut msg as *mut IpcMessage as usize) };
@@ -86,24 +197,17 @@ pub extern "C" fn main() -> ! {
         }
 
         match msg.msg_type {
-            // ── MSG_KEY_SCANCODE (type 3): raw scancode from IRQ handler ──
-            // data[0] = the raw PS/2 scancode byte.
+            // ── MSG_KEY_SCANCODE (type 3): keyboard IRQ notification ──
+            // The payload carries no scancode: the byte is still sitting in
+            // the controller. Drain port 0x60 ourselves (ring 3, granted),
+            // in a burst so a fast typist never overruns the 1-byte buffer.
             3 => {
-                let scancode = msg.data[0];
-                // Bit 7 = 0 means "make" (key press). Ignore break codes.
-                if scancode & 0x80 == 0 {
-                    if let Some(ch) = decode_scancode(scancode) {
-                        // Buffer the decoded key (drop if full).
-                        let next = (buf_tail + 1) % KEY_BUF_CAPACITY;
-                        if next != buf_head {
-                            key_buf[buf_tail] = ch;
-                            buf_tail = next;
-                        }
-                        // Echo the key to VGA so the user can see what they typed.
-                        // The kernel forwards this via IPC to the VGA server.
-                        unsafe { let _ = vga_write(ch as usize); }
-                    }
+                unsafe {
+                    let _ = vga_write(b'K' as usize);
+                    let _ = vga_write(b'3' as usize);
+                    let _ = vga_write(b' ' as usize);
                 }
+                drain_pending(&mut key_buf, &mut buf_head, &mut buf_tail);
             }
             // ── MSG_KEY_REQUEST (type 4): a client wants a key ──
             // Reply with type 5 (MSG_KEY_EVENT) addressed to the sender.

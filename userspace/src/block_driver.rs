@@ -1,13 +1,13 @@
-//! Legacy virtio-blk driver used by the user-space storage server.
+//! ISA-style IDE hard-disk driver used by the user-space storage server.
 //!
-//! LESSON (microkernel boundary): the kernel discovers the PCI function, grants
-//! this process only its BAR0 I/O ports, and maps a pinned contiguous DMA queue.
-//! This module owns the device protocol, block requests, and sector API; the
-//! kernel does not parse FAT or perform disk reads/writes on the server's behalf.
+//! LESSON (microkernel boundary): the kernel grants this process only the IDE
+//! register ports (0x1F0..0x1F7) via its TSS I/O bitmap. This module owns the
+//! block protocol: command registers, LBA geometry, and the data-port transfer.
+//! The kernel never parses FAT or touches the disk on the server's behalf.
 //!
-//! This educational driver intentionally uses one synchronous request at a
-//! time. That keeps descriptor ownership easy to follow while still exercising
-//! real DMA, legacy virtio ring layout, and device completion.
+//! The classic ATA task-file interface (as emulated by QEMU `pc` + `-hda`)
+//! uses eight registers at 0x1F0..0x1F7 and transfers sector bytes through the
+//! 16-bit data port with IN/OUT word operations. LBAs are 0-based (LBA28).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -15,172 +15,100 @@ use core::sync::atomic::{compiler_fence, Ordering};
 pub const SECTOR_SIZE: usize = 512;
 
 /// User virtual address where the kernel maps the driver's contiguous DMA area.
+/// Unused by the IDE transport but kept for the kernel's storage-config ABI.
 pub const DMA_QUEUE_VADDR: usize = 0x3000_0000;
-/// Maximum legacy queue size supported by the reference QEMU configuration.
-pub const MAX_QUEUE_SIZE: usize = 256;
-/// Four pages cover a 256-entry descriptor/available/used ring plus scratch
-/// request, status, and 512-byte bounce-buffer storage.
-pub const DMA_QUEUE_PAGES: usize = 4;
 
-const REQ_IN: u32 = 0;
-const REQ_OUT: u32 = 1;
-const DESC_F_NEXT: u16 = 1;
-const DESC_F_WRITE: u16 = 2;
+/// IDE data port (first of the eight granted registers).
+pub const IDE_DATA_PORT: u16 = 0x1F0;
+/// Number of IDE register ports granted to this process.
+pub const IDE_IO_PORT_LEN: u16 = 8;
 
+const CMD_READ: u8 = 0x20;
+const CMD_WRITE: u8 = 0x30;
+
+/// Register offsets relative to the granted base (base + offset = port).
 mod reg {
-    pub const GUEST_FEATURES: u16 = 0x04;
-    pub const QUEUE_PFN: u16 = 0x08;
-    pub const QUEUE_NUM: u16 = 0x0C;
-    pub const QUEUE_SEL: u16 = 0x0E;
-    pub const QUEUE_NOTIFY: u16 = 0x10;
-    pub const STATUS: u16 = 0x12;
-    pub const DEVICE_CONFIG: u16 = 0x14;
+    pub const DATA: u16 = 0; // 0x1F0 data (16-bit word I/O)
+    pub const ERROR: u16 = 1; // 0x1F1 error (read) / features (write)
+    pub const COUNT: u16 = 2; // 0x1F2 sector count
+    pub const LBA_LOW: u16 = 3; // 0x1F3 LBA[7:0]
+    pub const LBA_MID: u16 = 4; // 0x1F4 LBA[15:8]
+    pub const LBA_HIGH: u16 = 5; // 0x1F5 LBA[23:16]
+    pub const DRIVE: u16 = 6; // 0x1F6 0xE0 | LBA[27:24] (master, LBA mode)
+    pub const STATUS: u16 = 7; // 0x1F7 status (read) / command (write)
 }
 
 mod status {
-    pub const ACKNOWLEDGE: u8 = 1;
-    pub const DRIVER: u8 = 2;
-    pub const DRIVER_OK: u8 = 4;
-    pub const FEATURES_OK: u8 = 8;
+    pub const BSY: u8 = 0x80;
+    pub const DRQ: u8 = 0x08;
+    pub const ERR: u8 = 0x01;
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Descriptor {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
-
-#[repr(C)]
-struct BlockRequest {
-    request_type: u32,
-    reserved: u32,
-    sector: u64,
-}
-
-#[derive(Clone, Copy)]
-struct QueueLayout {
-    avail_off: usize,
-    avail_ring_off: usize,
-    used_off: usize,
-    request_off: usize,
-    status_off: usize,
-    data_off: usize,
-}
-
-/// Compute the legacy ring offsets from the device's actual queue size.
-///
-/// The used ring starts on a 4 KiB boundary; scratch request data lives after
-/// the full used ring, not over unused-looking slots the device may still DMA.
-fn queue_layout(queue_size: usize) -> Option<QueueLayout> {
-    if !(3..=MAX_QUEUE_SIZE).contains(&queue_size) {
-        return None;
-    }
-    let avail_off = queue_size.checked_mul(core::mem::size_of::<Descriptor>())?;
-    let avail_ring_off = avail_off.checked_add(4)?; // flags + idx
-    let avail_end = avail_ring_off.checked_add(queue_size.checked_mul(2)?)?;
-    let used_off = avail_end.checked_add(4095)? & !4095;
-    let used_end = used_off.checked_add(4)?.checked_add(queue_size.checked_mul(8)?)?;
-    let scratch_off = used_end.checked_add(4095)? & !4095;
-    let request_off = scratch_off;
-    let status_off = request_off.checked_add(core::mem::size_of::<BlockRequest>())?;
-    let data_off = status_off.checked_add(1)?;
-    if data_off.checked_add(SECTOR_SIZE)? > DMA_QUEUE_PAGES * 4096 {
-        return None;
-    }
-    Some(QueueLayout {
-        avail_off,
-        avail_ring_off,
-        used_off,
-        request_off,
-        status_off,
-        data_off,
-    })
-}
-
-/// Set once from the kernel's boot-time storage-resource IPC message. The
-/// storage-server process is single-threaded and issues synchronous requests.
-static mut IO_BASE: u16 = 0;
-static mut QUEUE_PHYS: u64 = 0;
+/// Reason code of the most recent failed transfer: 1 = device never became
+/// ready (timeout or floating bus), 2 = device reported an error.
+static mut LAST_REASON: u8 = 0;
+/// Sector count reported by the kernel's storage-config message (0 = unknown).
 static mut SECTOR_COUNT: u64 = 0;
-static mut QUEUE_SIZE: usize = 0;
-static mut AVAIL_INDEX: u16 = 0;
-static mut LAST_USED_INDEX: u16 = 0;
+/// Set once from the kernel's boot-time storage-resource IPC message.
+static mut IO_BASE: u16 = 0;
 
-/// Configure the legacy device and queue using kernel-granted resources.
-///
-/// `io_base` is a BAR0 base, not a PCI config address. `queue_phys` names the
-/// first of four contiguous pages, mapped for this process at
-/// `DMA_QUEUE_VADDR`. The hardware sees physical addresses from descriptors;
-/// the process writes the same memory through its user mapping.
-pub unsafe fn init(io_base: u16, queue_phys: u64) -> bool {
-    if io_base == 0 || queue_phys == 0 || queue_phys & 0xFFF != 0 {
+/// Configure the device using kernel-granted resources. `io_base` is the first
+/// granted IDE register port; `queue_phys` is unused by this transport.
+pub unsafe fn init(io_base: u16, _queue_phys: u64) -> bool {
+    if io_base == 0 {
         return false;
     }
-
-    outb(io_base + reg::STATUS, 0); // reset
-    outb(io_base + reg::STATUS, status::ACKNOWLEDGE | status::DRIVER);
-
-    // Negotiate no optional features: basic 512-byte read/write requests only.
-    outl(io_base + reg::GUEST_FEATURES, 0);
-    outb(
-        io_base + reg::STATUS,
-        status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK,
-    );
-    if inb(io_base + reg::STATUS) & status::FEATURES_OK == 0 {
-        return false;
-    }
-
-    outw(io_base + reg::QUEUE_SEL, 0);
-    let queue_size = inw(io_base + reg::QUEUE_NUM) as usize;
-    if queue_size < 3 || queue_size > MAX_QUEUE_SIZE {
-        return false;
-    }
-
-    // Legacy capacity is a little-endian u64 at the device config area.
-    let sectors = inl(io_base + reg::DEVICE_CONFIG) as u64
-        | ((inl(io_base + reg::DEVICE_CONFIG + 4) as u64) << 32);
-    if sectors == 0 {
-        return false;
-    }
-
-    // The driver only uses descriptor heads 0..2; the full ring is nevertheless
-    // laid out according to the device's actual queue size (not an assumed size).
-    outl(io_base + reg::QUEUE_PFN, (queue_phys >> 12) as u32);
-    outb(
-        io_base + reg::STATUS,
-        status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
-    );
-
     IO_BASE = io_base;
-    QUEUE_PHYS = queue_phys;
-    SECTOR_COUNT = sectors;
-    QUEUE_SIZE = queue_size;
-    AVAIL_INDEX = 0;
-    LAST_USED_INDEX = 0;
+    // A missing device leaves the bus floating (0xFF). Wait briefly for BSY
+    // to clear; QEMU's emulated disk is ready almost immediately.
+    if !wait_not_busy() {
+        LAST_REASON = 1;
+        IO_BASE = 0;
+        return false;
+    }
+    if inb(io_base + reg::STATUS) == 0xFF {
+        LAST_REASON = 1;
+        IO_BASE = 0;
+        return false;
+    }
+    LAST_REASON = 0;
     true
 }
 
+/// Reason code of the most recent failed transfer.
+pub unsafe fn last_reason() -> u8 {
+    unsafe { LAST_REASON }
+}
+
+/// Sector count from the kernel storage config (0 if never provided).
+pub unsafe fn sector_count() -> u64 {
+    unsafe { SECTOR_COUNT }
+}
+
 /// Read one 512-byte sector. Returns false if uninitialized, out of range, or
-/// if the device reports an error/does not complete in time.
+/// if the device rejects the command.
 pub fn read_sector(sector: usize, out: &mut [u8; SECTOR_SIZE]) -> bool {
     unsafe {
-        if IO_BASE == 0 || sector as u64 >= SECTOR_COUNT {
+        if IO_BASE == 0 {
             return false;
         }
-        transfer(sector, out.as_mut_ptr(), REQ_IN)
+        if SECTOR_COUNT != 0 && sector as u64 >= SECTOR_COUNT {
+            return false;
+        }
+        transfer(sector, out.as_mut_ptr(), CMD_READ)
     }
 }
 
 /// Write one 512-byte sector.
 pub fn write_sector(sector: usize, input: &[u8; SECTOR_SIZE]) -> bool {
     unsafe {
-        if IO_BASE == 0 || sector as u64 >= SECTOR_COUNT {
+        if IO_BASE == 0 {
             return false;
         }
-        transfer(sector, input.as_ptr(), REQ_OUT)
+        if SECTOR_COUNT != 0 && sector as u64 >= SECTOR_COUNT {
+            return false;
+        }
+        transfer(sector, input.as_ptr(), CMD_WRITE)
     }
 }
 
@@ -194,12 +122,12 @@ pub fn read_bytes(offset: usize, out: &mut [u8]) -> usize {
         };
         let sector = byte_offset / SECTOR_SIZE;
         let in_sector = byte_offset % SECTOR_SIZE;
-        let amount = core::cmp::min(SECTOR_SIZE - in_sector, out.len() - total);
+        let amount = usize_min(SECTOR_SIZE - in_sector, out.len() - total);
         let mut scratch = [0u8; SECTOR_SIZE];
         if !read_sector(sector, &mut scratch) {
             break;
         }
-        out[total..total + amount].copy_from_slice(&scratch[in_sector..in_sector + amount]);
+        unsafe { copy_bytes(&scratch[in_sector], out.as_mut_ptr().add(total), amount); }
         total += amount;
     }
     total
@@ -216,12 +144,16 @@ pub fn write_bytes(offset: usize, input: &[u8]) -> usize {
         };
         let sector = byte_offset / SECTOR_SIZE;
         let in_sector = byte_offset % SECTOR_SIZE;
-        let amount = core::cmp::min(SECTOR_SIZE - in_sector, input.len() - total);
+        let amount = usize_min(SECTOR_SIZE - in_sector, input.len() - total);
         let mut scratch = [0u8; SECTOR_SIZE];
-        if (in_sector != 0 || amount != SECTOR_SIZE) && !read_sector(sector, &mut scratch) {
-            break;
+        if in_sector != 0 || amount != SECTOR_SIZE {
+            if !read_sector(sector, &mut scratch) {
+                break;
+            }
+            unsafe { copy_bytes(input.as_ptr().add(total), scratch.as_mut_ptr().add(in_sector), amount); }
+        } else {
+            unsafe { copy_bytes(input.as_ptr().add(total), scratch.as_mut_ptr(), amount); }
         }
-        scratch[in_sector..in_sector + amount].copy_from_slice(&input[total..total + amount]);
         if !write_sector(sector, &scratch) {
             break;
         }
@@ -230,87 +162,118 @@ pub fn write_bytes(offset: usize, input: &[u8]) -> usize {
     total
 }
 
-unsafe fn transfer(sector: usize, caller_data: *const u8, request_type: u32) -> bool {
+/// Issue one ATA PIO command and stream the buffer through the 16-bit data
+/// port. `sector` is a 0-based LBA28 sector number.
+unsafe fn transfer(sector: usize, buffer: *const u8, command: u8) -> bool {
     let base = IO_BASE;
-    let queue_va = DMA_QUEUE_VADDR;
-    let queue_pa = QUEUE_PHYS as usize;
-    let qsize = QUEUE_SIZE;
-
-    let layout = match queue_layout(qsize) {
-        Some(layout) => layout,
-        None => return false,
-    };
-    let desc_off = 0usize;
-
-    let request = BlockRequest {
-        request_type,
-        reserved: 0,
-        sector: sector as u64,
-    };
-    core::ptr::write_unaligned((queue_va + layout.request_off) as *mut BlockRequest, request);
-    core::ptr::write_unaligned((queue_va + layout.status_off) as *mut u8, 0xFF);
-
-    if request_type == REQ_OUT {
-        core::ptr::copy_nonoverlapping(caller_data as *const u8, (queue_va + layout.data_off) as *mut u8, SECTOR_SIZE);
+    let lba = sector as u32;
+    if lba > 0x0FFF_FFFF {
+        LAST_REASON = 2; // outside LBA28 range
+        return false;
     }
-
-    let descriptors = [
-        Descriptor {
-            addr: (queue_pa + layout.request_off) as u64,
-            len: core::mem::size_of::<BlockRequest>() as u32,
-            flags: DESC_F_NEXT,
-            next: 1,
-        },
-        Descriptor {
-            addr: (queue_pa + layout.data_off) as u64,
-            len: SECTOR_SIZE as u32,
-            flags: DESC_F_NEXT | if request_type == REQ_IN { DESC_F_WRITE } else { 0 },
-            next: 2,
-        },
-        Descriptor {
-            addr: (queue_pa + layout.status_off) as u64,
-            len: 1,
-            flags: DESC_F_WRITE,
-            next: 0,
-        },
-    ];
-    for (index, descriptor) in descriptors.iter().enumerate() {
-        core::ptr::write_unaligned(
-            (queue_va + desc_off + index * core::mem::size_of::<Descriptor>()) as *mut Descriptor,
-            *descriptor,
-        );
+    if !wait_not_busy() {
+        LAST_REASON = 1;
+        return false;
     }
-
-    let slot = (AVAIL_INDEX as usize) % qsize;
-    core::ptr::write_unaligned((queue_va + layout.avail_ring_off + slot * 2) as *mut u16, 0);
+    // Select master drive in LBA mode, then give the device ~400ns to latch
+    // the head register before the remaining task-file bytes go out.
+    outb(base + reg::DRIVE, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    for _ in 0..4 {
+        let _ = inb(base + reg::STATUS);
+    }
+    outb(base + reg::COUNT, 1);
+    outb(base + reg::LBA_LOW, (lba & 0xFF) as u8);
+    outb(base + reg::LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    outb(base + reg::LBA_HIGH, ((lba >> 16) & 0xFF) as u8);
+    outb(base + reg::STATUS, command);
     compiler_fence(Ordering::SeqCst);
-    AVAIL_INDEX = AVAIL_INDEX.wrapping_add(1);
-    core::ptr::write_unaligned((queue_va + layout.avail_off + 2) as *mut u16, AVAIL_INDEX);
 
-    let before = LAST_USED_INDEX;
-    outw(base + reg::QUEUE_NOTIFY, 0);
-    let mut completed = false;
+    if command == CMD_READ {
+        if !wait_data_ready() {
+            LAST_REASON = 1;
+            return false;
+        }
+        for i in 0..(SECTOR_SIZE / 2) {
+            store_u16(buffer as usize + i * 2, inw(base + reg::DATA));
+        }
+        compiler_fence(Ordering::SeqCst);
+        if !wait_not_busy() {
+            LAST_REASON = 1;
+            return false;
+        }
+        if inb(base + reg::STATUS) & status::ERR != 0 {
+            LAST_REASON = 2;
+            return false;
+        }
+    } else {
+        if !wait_data_ready() {
+            LAST_REASON = 1;
+            return false;
+        }
+        for i in 0..(SECTOR_SIZE / 2) {
+            outw(base + reg::DATA, load_u16(buffer as usize + i * 2));
+        }
+        compiler_fence(Ordering::SeqCst);
+        if !wait_not_busy() {
+            LAST_REASON = 1;
+            return false;
+        }
+        if inb(base + reg::STATUS) & status::ERR != 0 {
+            LAST_REASON = 2;
+            return false;
+        }
+    }
+    LAST_REASON = 0;
+    true
+}
+
+/// Spin until BSY clears (bounded so a missing device cannot hang us).
+unsafe fn wait_not_busy() -> bool {
     for _ in 0..1_000_000u32 {
-        let now = core::ptr::read_unaligned((queue_va + layout.used_off + 2) as *const u16);
-        if now != before {
-            LAST_USED_INDEX = now;
-            completed = true;
-            break;
+        let s = inb(IO_BASE + reg::STATUS);
+        if s != 0xFF && s & status::BSY == 0 {
+            return true;
         }
         core::hint::spin_loop();
     }
-    if !completed || core::ptr::read_unaligned((queue_va + layout.status_off) as *const u8) != 0 {
-        return false;
+    false
+}
+
+/// Spin until the device requests the data transfer (DRQ with BSY clear).
+unsafe fn wait_data_ready() -> bool {
+    for _ in 0..1_000_000u32 {
+        let s = inb(IO_BASE + reg::STATUS);
+        if s & status::BSY == 0 {
+            if s & status::ERR != 0 {
+                return false;
+            }
+            if s & status::DRQ != 0 {
+                return true;
+            }
+        }
+        core::hint::spin_loop();
     }
-    compiler_fence(Ordering::SeqCst);
-    if request_type == REQ_IN {
-        core::ptr::copy_nonoverlapping(
-            (queue_va + layout.data_off) as *const u8,
-            caller_data as *mut u8,
-            SECTOR_SIZE,
-        );
-    }
-    true
+    false
+}
+
+#[inline]
+fn usize_min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+#[inline]
+unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    core::ptr::copy_nonoverlapping(src, dst, n);
+}
+
+#[inline]
+unsafe fn store_u16(addr: usize, value: u16) {
+    core::ptr::write_unaligned(addr as *mut u16, value);
+}
+
+#[inline]
+unsafe fn load_u16(addr: usize) -> u16 {
+    core::ptr::read_unaligned(addr as *const u16)
 }
 
 #[inline]
@@ -335,35 +298,4 @@ unsafe fn inw(port: u16) -> u16 {
 #[inline]
 unsafe fn outw(port: u16, value: u16) {
     core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nostack, preserves_flags));
-}
-
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nostack, preserves_flags));
-    value
-}
-
-#[inline]
-unsafe fn outl(port: u16, value: u32) {
-    core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack, preserves_flags));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn largest_supported_legacy_queue_fits_dma_allocation() {
-        let layout = queue_layout(MAX_QUEUE_SIZE).expect("reference queue fits");
-        assert_eq!(layout.used_off, 0x2000);
-        assert!(layout.data_off + SECTOR_SIZE <= DMA_QUEUE_PAGES * 4096);
-    }
-
-    #[test]
-    fn queue_layout_rejects_unsupported_sizes() {
-        assert!(queue_layout(0).is_none());
-        assert!(queue_layout(2).is_none());
-        assert!(queue_layout(MAX_QUEUE_SIZE + 1).is_none());
-    }
 }

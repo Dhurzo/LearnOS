@@ -80,14 +80,16 @@ long_mode_start:
      *   [2] Ring 0 Data (DPL=0)                          → selector 0x10
      *   [3] Ring 3 Code (64-bit, DPL=3)                  → selector 0x18 + RPL3 = 0x1B
      *   [4] Ring 3 Data (DPL=3)                          → selector 0x20 + RPL3 = 0x23
-     *   [5] TSS descriptor (low 8 bytes)                 → selector 0x28
-     *   [6] TSS descriptor (high 8 bytes)                → selector 0x30
+     *   [5] Ring 3 Code for SYSRET base 0x18             → selector 0x28 + RPL3 = 0x2B
+     *   [6] TSS descriptor (low 8 bytes)                 → selector 0x30
+     *   [7] TSS descriptor (high 8 bytes)                → selector 0x38
      *
-     * Entries [3] and [4] are used by IRETQ when returning
-     * to ring-3 user space. SYSCALL/SYSRET hardcode their
-     * own descriptor caches (Intel SDM Vol 2B).
+     * SYSRET uses STAR[63:48] as a base and loads CS = base + 16,
+     * SS = base + 8. With STAR[63:48] = 0x18, that selects entries
+     * [5] (code) and [4] (data), so user-mode SYSRET returns use
+     * CS = 0x2B and SS = 0x23. IRETQ frames use the same selectors.
      *
-     * Entry [5]+[6] form the 16-byte system descriptor for
+     * Entries [6]+[7] form the 16-byte system descriptor for
      * the Task State Segment. The actual TSS data structure
      * is defined in Rust (tss.rs).
      */
@@ -98,8 +100,9 @@ gdt64:
     .quad 0x0000920000000000       /* 0x10: Ring 0 Data */
     .quad 0x0020FA0000000000       /* 0x18: Ring 3 Code (64-bit long mode) */
     .quad 0x0000F20000000000       /* 0x20: Ring 3 Data */
-    .quad 0x0000000000000000       /* 0x28: TSS desc low (Rust fills in) */
-    .quad 0x0000000000000000       /* 0x30: TSS desc high (Rust fills in) */
+    .quad 0x0020FA0000000000       /* 0x28: Ring 3 Code for SYSRET base 0x18 */
+    .quad 0x0000000000000000       /* 0x30: TSS desc low (Rust fills in) */
+    .quad 0x0000000000000000       /* 0x38: TSS desc high (Rust fills in) */
 gdt64_end:
 
 .align 4

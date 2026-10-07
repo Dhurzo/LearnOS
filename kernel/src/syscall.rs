@@ -72,6 +72,11 @@ pub fn set_storage_server_pid(pid: u16) {
     unsafe { STORAGE_SERVER_PID = pid };
 }
 
+/// Permission denied: the caller lacks the capability for the requested
+/// endpoint or operation. Returned instead of -1 so user space can tell
+/// "bad arguments" apart from "not allowed".
+pub const EACCES: isize = -2;
+
 pub mod syscall_nr {
     pub const EXIT: usize = 0;
     pub const WRITE: usize = 1;
@@ -93,6 +98,12 @@ pub mod syscall_nr {
     pub const CAP_SEND: usize = 16;
     pub const REGISTER_SIGNAL: usize = 17;
     pub const WAIT_SIGNAL: usize = 18;
+    /// Grant a held capability bit to another process (delegation).
+    pub const GRANT_CAP: usize = 19;
+    /// Send a signal to another process.
+    pub const KILL: usize = 20;
+    /// Replace this process's image with the ELF at the given user buffer.
+    pub const EXEC: usize = 21;
 }
 
 /// The legacy INT 0x80 vector is defined here for reference.
@@ -109,6 +120,15 @@ pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> isize;
 pub struct SyscallTable {
     handlers: [Option<SyscallHandler>; 32],
 }
+
+/// Kernel RSP at `syscall_entry`, captured before `call syscall_dispatch`.
+///
+/// `sys_exec` needs it to rewrite the saved return state (RCX/RFLAGS slots)
+/// so `sysretq` resumes the NEW image instead of the old one. Written by
+/// assembly on every syscall entry; read only by `sys_exec` on its own path
+/// (interrupts are masked on entry via SFMASK, so no nesting races it).
+#[no_mangle]
+pub static mut SYSCALL_FRAME_SAVE: u64 = 0;
 
 impl SyscallTable {
     pub const fn new() -> Self {
@@ -169,6 +189,10 @@ pub static SYSCALL_TABLE: SyscallTable = {
     table.handlers[syscall_nr::CAP_SEND] = Some(sys_cap_send);
     table.handlers[syscall_nr::REGISTER_SIGNAL] = Some(sys_register_signal);
     table.handlers[syscall_nr::WAIT_SIGNAL] = Some(sys_wait_signal);
+    table.handlers[syscall_nr::GRANT_CAP] = Some(sys_grant_cap);
+    table.handlers[syscall_nr::KILL] = Some(sys_kill);
+    table.handlers[syscall_nr::EXEC] = Some(sys_exec);
+    table.handlers[syscall_nr::BRK] = Some(sys_brk);
     table
 };
 
@@ -288,6 +312,110 @@ fn sys_getpid(_a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: u
     process::get_current_pid() as isize
 }
 
+/// BRK: Adjust the process break (heap end) to `new_break`.
+///
+/// The heap lives in `[USER_HEAP_START, USER_HEAP_END)`. Pages are mapped on
+/// demand (zero-filled) and unmapped on shrink. `new_break == 0` queries the
+/// current break without changing it. Requests below the start clamp to the
+/// start; requests past the end fail with -1. Returns the resulting break.
+///
+/// # Safety
+///
+/// Runs on the caller's live address space; growth maps fresh frames, shrink
+/// unmaps plus `invlpg` so no stale translation survives.
+fn sys_brk(new_break: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    use crate::paging::{
+        alloc_frame, free_frame, invlpg, map_phys_page, munmap_range,
+        page_flags, write_user_memory, USER_HEAP_END, USER_HEAP_START, PAGE_SIZE,
+    };
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    let (cr3, old_end) = unsafe {
+        match process::PROCESS_TABLE.get(current) {
+            Some(p) => (p.cr3, p.heap_end),
+            None => return -1,
+        }
+    };
+    if new_break == 0 {
+        return old_end as isize; // query
+    }
+    let mut target = new_break as u64;
+    if target < USER_HEAP_START {
+        target = USER_HEAP_START;
+    }
+    if target > USER_HEAP_END {
+        return -1;
+    }
+    let align_up = |v: u64| (v + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let old_page = align_up(old_end);
+    let new_page = align_up(target);
+    // Zero-fill in stack-friendly chunks (the kernel stack is one page).
+    static ZEROS: [u8; 512] = [0; 512];
+    if new_page > old_page {
+        // Grow one page at a time; heap_end tracks the mapped high-water
+        // mark so a mid-way OOM leaves a consistent state.
+        let mut va = old_page;
+        while va < new_page {
+            let frame = alloc_frame();
+            if frame == 0 {
+                break;
+            }
+            let mapped = unsafe {
+                map_phys_page(
+                    cr3,
+                    va,
+                    frame,
+                    page_flags::PRESENT
+                        | page_flags::WRITABLE
+                        | page_flags::USER_ACCESS
+                        | page_flags::EXECUTABLE_DISABLE,
+                )
+            };
+            if !mapped {
+                free_frame(frame);
+                break;
+            }
+            let mut off = 0u64;
+            while off < PAGE_SIZE {
+                if unsafe { write_user_memory(cr3, va + off, &ZEROS) }.is_err() {
+                    break;
+                }
+                off += ZEROS.len() as u64;
+            }
+            if off < PAGE_SIZE {
+                break;
+            }
+            va += PAGE_SIZE;
+            unsafe {
+                if let Some(p) = process::PROCESS_TABLE.get_mut(current) {
+                    p.heap_end = va;
+                }
+            }
+        }
+        return unsafe {
+            process::PROCESS_TABLE
+                .get(current)
+                .map(|p| p.heap_end as isize)
+                .unwrap_or(-1)
+        };
+    } else if new_page < old_page {
+        unsafe {
+            munmap_range(cr3, new_page, old_page - new_page);
+            let mut va = new_page;
+            while va < old_page {
+                invlpg(va);
+                va += PAGE_SIZE;
+            }
+            if let Some(p) = process::PROCESS_TABLE.get_mut(current) {
+                p.heap_end = target;
+            }
+        }
+    }
+    target as isize
+}
+
 /// GET_SERVER_PID: Return the PID of a well-known server process.
 ///
 /// `server` selects which server to look up:
@@ -398,12 +526,13 @@ fn sys_ipc_send(dst_pid: usize, msg_ptr: usize, _a3: usize, _a4: usize, _a5: usi
     }
 
     // Phase 4 — Capability enforcement: the sender must hold a capability
-    // for the destination PID's endpoint type.
+    // for the destination PID's endpoint type. Denial is EACCES (-2) so
+    // user space can distinguish it from malformed arguments (-1).
     unsafe {
         let pt = &raw mut process::PROCESS_TABLE;
         if let Some(sender) = (*pt).get_mut(current) {
             if !crate::capability::check_ipc_send(sender.capabilities, dst_pid as u16) {
-                return -1; // No capability — rejected
+                return EACCES; // No capability — rejected
             }
         }
     }
@@ -534,6 +663,184 @@ fn sys_cap_send(dst_pid: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize, 
         }
     }
     -1
+}
+
+/// GRANT_CAP: Delegate a held capability bit to another process.
+///
+/// a1 = destination PID, a2 = capability bit (0..63).
+/// The caller must hold the bit itself (see `capability::can_grant`).
+/// Returns 0 on success, -1 on malformed arguments or unknown PID,
+/// EACCES (-2) when the caller does not hold the bit.
+fn sys_grant_cap(dst_pid: usize, cap: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    let current = process::get_current_pid();
+    if current == 0 || dst_pid == 0 || dst_pid > u16::MAX as usize {
+        return -1;
+    }
+    if cap >= crate::capability::MAX_CAPABILITIES {
+        return -1;
+    }
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        let caller_caps = match (*pt).get(current) {
+            Some(p) => p.capabilities,
+            None => return -1,
+        };
+        if !crate::capability::can_grant(caller_caps, cap) {
+            return EACCES;
+        }
+        match (*pt).get_mut(dst_pid as u16) {
+            Some(dst) => {
+                crate::capability::grant(&mut dst.capabilities, cap);
+                0
+            }
+            None => -1,
+        }
+    }
+}
+
+/// KILL: Send a signal to another process.
+///
+/// a1 = target PID, a2 = signal number (0..63, see `signal::sig_num`).
+/// Returns 0 once the signal bit is set, -1 on unknown PID or bad signal.
+///
+/// # Policy
+///
+/// Any user process may signal any other in this phase (open policy,
+/// documented here rather than hidden): `SIGSTOP`/`SIGCONT`/`SIGTERM` are
+/// the shell's job-control tools, and capabilities already gate IPC.
+/// A per-sender kill policy can replace this check without touching callers.
+fn sys_kill(pid: usize, sig: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    if pid == 0 || pid > u16::MAX as usize || sig >= crate::signal::MAX_SIGNALS {
+        return -1;
+    }
+    let target = pid as u16;
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        if (*pt).get(target).is_none() {
+            return -1;
+        }
+        crate::vga::serial_print("kill: pid=");
+        crate::vga::serial_print_hex("", target as u64);
+        crate::vga::serial_print(" sig=");
+        crate::vga::serial_print_hex("", sig as u64);
+        crate::vga::serial_print("\n");
+        crate::signal::send_signal(target, sig);
+    }
+    0
+}
+
+/// EXEC: Replace this process's image with the ELF at a user buffer.
+///
+/// a1 = buffer pointer, a2 = byte length (1..=256 KiB).
+/// The caller must hold the EXEC capability. On success this never returns:
+/// the address space is swapped, the PCB registers/stack/heap/signals are
+/// reset, and `sysretq` resumes the new entry point with a fresh stack.
+/// Returns -1 on bad image/range/OOM (current image keeps running),
+/// EACCES (-2) without the EXEC capability.
+///
+/// # Safety
+///
+/// Reads the caller's own (live) address space for the ELF bytes; builds the
+/// new space before touching the old one; the kernel identity map survives
+/// the CR3 switch, and interrupts are masked on syscall entry.
+fn sys_exec(buf_ptr: usize, len: usize, _a3: usize, _a4: usize, _a5: usize, _nr: usize) -> isize {
+    const MAX_EXEC_BYTES: usize = 256 * 1024;
+    if len == 0 || len > MAX_EXEC_BYTES {
+        return -1;
+    }
+    if !is_valid_user_range(buf_ptr, len, false) {
+        return -1;
+    }
+    if !current_process_has_capability(crate::capability::cap_id::EXEC) {
+        return EACCES;
+    }
+    let current = process::get_current_pid();
+    if current == 0 {
+        return -1;
+    }
+    // Borrow the ELF bytes from the caller's live mapping (single-threaded:
+    // no one else can mutate them under us).
+    let image: &[u8] =
+        unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+
+    // Build the replacement address space first; the old one stays live.
+    let new_cr3 = match crate::paging::create_address_space(None) {
+        Some(cr3) => cr3,
+        None => return -1,
+    };
+    let rollback = |cr3: u64| unsafe {
+        crate::paging::free_user_address_space(cr3);
+    };
+    let loaded = unsafe { crate::elf::load_elf(image, new_cr3) };
+    let loaded = match loaded {
+        Ok(l) => l,
+        Err(_) => {
+            rollback(new_cr3);
+            return -1;
+        }
+    };
+    if !crate::paging::map_user_stack(new_cr3) {
+        rollback(new_cr3);
+        return -1;
+    }
+    // VGA alias parity with spawn_from_elf (every process gets it).
+    let vga_ok = unsafe {
+        crate::paging::map_phys_page(
+            new_cr3,
+            crate::paging::VGA_BUFFER_VADDR,
+            crate::paging::VGA_PHYS_ADDR,
+            crate::paging::page_flags::PRESENT
+                | crate::paging::page_flags::WRITABLE
+                | crate::paging::page_flags::USER_ACCESS
+                | crate::paging::page_flags::CACHE_DISABLE
+                | crate::paging::page_flags::EXECUTABLE_DISABLE,
+        )
+    };
+    if !vga_ok {
+        rollback(new_cr3);
+        return -1;
+    }
+
+    // Commit: swap address spaces, reset PCB state, rewrite the syscall
+    // return frame. From here on nothing touches the old image.
+    unsafe {
+        let pt = &raw mut process::PROCESS_TABLE;
+        let old_cr3 = match (*pt).get(current) {
+            Some(p) => p.cr3,
+            None => {
+                rollback(new_cr3);
+                return -1;
+            }
+        };
+        if let Some(p) = (*pt).get_mut(current) {
+            p.cr3 = new_cr3;
+            p.entry_point = loaded.entry;
+            p.registers = process::ProcessRegisters::default();
+            p.registers.rip = loaded.entry;
+            p.registers.rsp = loaded.stack_top;
+            p.heap_end = crate::paging::USER_HEAP_START;
+            p.signal_pending = 0;
+            p.signal_handlers = [None; 64];
+            // Capabilities and I/O grants identify the sandbox, not the
+            // image: they survive exec by design.
+        }
+        // Kernel identity mappings exist in every space, so the stack and
+        // statics stay valid across the switch.
+        core::arch::asm!("mov cr3, {}", in(reg) new_cr3, options(nostack));
+        crate::paging::free_user_address_space(old_cr3);
+        // Rewrite the saved sysret state captured at entry: K points at the
+        // 8 pushed regs whose lowest slots are the last-pushed RCX (return
+        // RIP at K+0) and R11 (return RFLAGS at K+8) — see syscall_entry's
+        // push/pop order. RSP for sysret comes from USER_RSP_SAVE.
+        let k = SYSCALL_FRAME_SAVE;
+        core::ptr::write_unaligned(k as *mut u64, loaded.entry);
+        core::ptr::write_unaligned((k + 8) as *mut u64, 0x202);
+        crate::tss::USER_RSP_SAVE = loaded.stack_top;
+        crate::vga::serial_print("exec: new rip=");
+        crate::vga::serial_print_hex("", loaded.entry);
+        crate::vga::serial_print("\n");
+    }
+    0
 }
 
 /// REGISTER_SIGNAL: Register a signal handler function.
@@ -671,6 +978,11 @@ core::arch::global_asm!(
     "    mov rsi, rdi",
     "    mov rdi, rax",
     "",
+    // Snapshot the entry RSP (points at the 8 pushed regs) so sys_exec
+    // can rewrite the saved RCX/RFLAGS return slots below. Push order is
+    // r15..rcx, so rcx sits at the LOWEST address: RCX slot = K+0 (saved
+    // RIP), R11 slot = K+8 (saved RFLAGS) — matching the pop order below.
+    "    mov [rip + SYSCALL_FRAME_SAVE], rsp",
     "    call syscall_dispatch",
     "",
     // Restore callee-saved regs (reverse order)
@@ -769,12 +1081,13 @@ core::arch::global_asm!(
     //   3. Restore all GP registers
     //   4. iretq back to user mode (to whatever process was running)
     //
-    // Why does the IRQ handler read port 0x60 instead of the keyboard server?
-    //   The PS/2 controller has a 1-byte input buffer. If we don't read it
-    //   promptly, a second keystroke overwrites the first (lost input).
-    //   Port I/O (in/out) is a privileged instruction — only the kernel
-    //   can do it. So the kernel reads the scancode and forwards it via IPC
-    //   to the user-space keyboard server.
+    // Why doesn't the IRQ handler read port 0x60 itself?
+    //   The PS/2 controller has a 1-byte input buffer. Reading it from the
+    //   handler would be fastest, but it keeps device I/O inside the kernel.
+    //   Instead the user-space keyboard server owns the port (TSS grant for
+    //   0x60/0x64, installed at spawn) and drains it when this IRQ notifies
+    //   it. Port I/O (in/out) from ring 3 is possible exactly because of
+    //   that per-process bitmap — no kernel mediation per keystroke.
     ".globl keyboard_entry",
     ".type keyboard_entry, @function",
     "keyboard_entry:",
@@ -890,6 +1203,38 @@ core::arch::global_asm!(
     "    jmp 1b",
 
     // =========================================================================
+    // DISK IRQ IGNORE STUBS (IRQ14/IRQ15, vectors 0x2E/0x2F)
+    // =========================================================================
+    //
+    // The ATA disk raises IRQ14 (primary) / IRQ15 (secondary) when a command
+    // completes. SeaBIOS leaves those PIC lines unmasked, so the interrupt
+    // arrives even though no IDT entry was installed — vectoring into a null
+    // descriptor raises #GP with error (vector<<3)|2 (e.g. 0x172 for 0x2E).
+    //
+    // The user-space storage driver polls the status register instead of
+    // waiting for interrupts, so the correct handling here is acknowledge +
+    // ignore: send EOI to the slave (0xA0) and master (0x20) PICs and return.
+    // A later phase may forward these IRQs to the storage server via IPC.
+    ".globl irq14_entry",
+    ".type irq14_entry, @function",
+    "irq14_entry:",
+    "    push rax",
+    "    mov al, 0x20",
+    "    out 0xA0, al",   // EOI slave PIC (IRQ8-15 live here)
+    "    out 0x20, al",   // EOI master PIC (cascade)
+    "    pop rax",
+    "    iretq",
+    ".globl irq15_entry",
+    ".type irq15_entry, @function",
+    "irq15_entry:",
+    "    push rax",
+    "    mov al, 0x20",
+    "    out 0xA0, al",
+    "    out 0x20, al",
+    "    pop rax",
+    "    iretq",
+
+    // =========================================================================
     // DOUBLE FAULT ENTRY POINT (vector 0x08)
     // =========================================================================
     //
@@ -913,6 +1258,8 @@ extern "C" {
     static keyboard_entry: u8;
     static pf_entry: u8;
     static gp_entry: u8;
+    static irq14_entry: u8;
+    static irq15_entry: u8;
     static df_entry: u8;
 }
 
@@ -926,7 +1273,7 @@ extern "C" {
 ///
 /// STAR (0xC0000081)
 ///   [47:32] = 0x08  Kernel CS for SYSCALL entry  → CS=0x08 (R0 code), SS=0x10 (R0 data)
-///   [63:48] = 0x08  SYSRET base                  → CS=0x18 (R3 code), SS=0x10+8=0x10 (data)
+///   [63:48] = 0x18  SYSRET base                  → CS=0x28 (R3 code), SS=0x20 (R3 data)
 ///                                                   (RPL forced to 3 by CPU)
 ///
 /// LSTAR (0xC0000082) = address of `syscall_entry`
@@ -938,8 +1285,8 @@ extern "C" {
 ///
 /// Writes to MSRs. Must be called once during boot, before any `syscall`.
 pub unsafe fn init_syscall() {
-    // STAR[47:32] = 0x08 (syscall CS), [63:48] = 0x08 (sysret base)
-    let star = (0x08u64 << 32) | (0x08u64 << 48);
+    // STAR[47:32] = 0x08 (syscall CS), [63:48] = 0x18 (sysret base)
+    let star = (0x08u64 << 32) | (0x18u64 << 48);
     wrmsr(0xC0000081, star);
 
     // LSTAR = address of syscall entry point
@@ -1010,6 +1357,16 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
     use crate::process::ProcessState;
 
+    // Ring-0 re-entrancy guard: a tick that interrupts ring-0 code (syscall
+    // path, another handler) pushes only a 3-item kernel frame, not the
+    // 5-item user frame below. Saving it as user state would corrupt the
+    // PCB and switching CR3 would strand the kernel stack — acknowledge
+    // and resume without touching anything.
+    if *frame.add(16) & 3 != 3 {
+        core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nostack));
+        return;
+    }
+
     // This function is called from the real IDT `timer_entry`; update the
     // monotonic clock here rather than in an unused parallel handler.
     crate::timer_tick();
@@ -1063,7 +1420,11 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
         crate::signal::deliver_pending(next);
 
         let next_state = if let Some(p) = (*table).get_mut(next) {
-            if p.state == ProcessState::Terminated {
+            // Terminated and Stopped processes are never resumed here:
+            // Terminated slots are dead, Stopped ones wait for SIGCONT
+            // (the scheduler never picks them; this also covers a stop
+            // that `deliver_pending` just applied above).
+            if p.state == ProcessState::Terminated || p.state == ProcessState::Stopped {
                 None
             } else {
                 p.state = ProcessState::Running;
@@ -1097,7 +1458,13 @@ pub unsafe extern "C" fn timer_save_and_switch(frame: *mut u64) {
         *frame.add(1) = regs.r14;
         *frame.add(0) = regs.r15;
         *frame.add(15) = regs.rip;
+        *frame.add(16) = 0x2B;   // ring-3 code selector (GDT 0x28 | RPL3)
         *frame.add(17) = regs.rflags;
+        *frame.add(18) = regs.rsp;
+        *frame.add(19) = 0x23;   // ring-3 data selector (GDT 0x20 | RPL3)
+
+        // Kernel identity mappings are supervisor-only and present in every
+        // process; changing CR3 therefore preserves the active kernel stack.
 
         // Kernel identity mappings are supervisor-only and present in every
         // process; changing CR3 therefore preserves the active kernel stack.
@@ -1173,7 +1540,10 @@ pub unsafe extern "C" fn page_fault_save_and_switch(frame: *mut u64) {
         }
         crate::signal::deliver_pending(next);
         let state = match (*table).get_mut(next) {
-            Some(p) if p.state != process::ProcessState::Terminated => {
+            Some(p)
+                if p.state != process::ProcessState::Terminated
+                    && p.state != process::ProcessState::Stopped =>
+            {
                 p.state = process::ProcessState::Running;
                 Some((p.registers, p.cr3, p.kernel_stack_top, p.io_port_ranges, p.io_port_range_count))
             }
@@ -1200,7 +1570,7 @@ pub unsafe extern "C" fn page_fault_save_and_switch(frame: *mut u64) {
             *frame.add(1) = regs.r14;
             *frame.add(0) = regs.r15;
             *frame.add(16) = regs.rip;
-            *frame.add(17) = 0x1B; // ring-3 code selector
+            *frame.add(17) = 0x2B; // ring-3 code selector
             *frame.add(18) = regs.rflags;
             *frame.add(20) = 0x23; // ring-3 data selector
             core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
@@ -1222,56 +1592,45 @@ pub unsafe extern "C" fn page_fault_save_and_switch(frame: *mut u64) {
 // This is called from the keyboard_entry assembly when IRQ1 fires.
 // Its job is minimal by design (microkernel philosophy):
 //
-//   1. Read the scancode from the PS/2 data port (0x60)
-//   2. Forward it to the user-space keyboard server via IPC
-//   3. Send End-Of-Interrupt to the PIC
+//   1. Forward the IRQ notification to the user-space keyboard server via IPC
+//   2. Send End-Of-Interrupt to the PIC
 //
-// Why does step 1 happen in the kernel and not in user space?
-//
-//   The PS/2 controller has a tiny 1-byte hardware buffer. If the CPU
-//   doesn't read it before the next keystroke arrives, the old byte is
-//   lost — overwritten by the new one. Port I/O (in/out instructions)
-//   is privileged (ring 0 only), so only the kernel can access it.
-//
-//   The solution: the kernel reads the raw scancode in ~microseconds
-//   (fast enough for any human typing speed), then forwards it to the
-//   user-space keyboard server which does the slow work of decoding
-//   and buffering. The kernel stays minimal and fast.
+// The PS/2 data port (0x60) is deliberately NOT read here. The keyboard
+// server owns that port through its TSS I/O grant and drains the scancode
+// itself from ring 3 when the notification arrives — the last piece of
+// device I/O moves out of the kernel (phase A1).
 //
 // This is the classic microkernel pattern: the kernel handles the
-// time-critical hardware access, but the driver logic lives in a
+// time-critical notification, but the driver logic lives in a
 // user-space process that could crash without bringing down the system.
 
-/// Read the keyboard scancode from port 0x60 and forward to the keyboard
-/// server via IPC.  Called from `keyboard_entry` assembly (IRQ1).
+/// Forward the keyboard IRQ to the keyboard server via IPC. Called from
+/// `keyboard_entry` assembly (IRQ1).
 ///
-/// # Timing constraint
+/// A1 purification: the kernel no longer touches the PS/2 data port. The
+/// scancode stays in the controller's 1-byte buffer until the user-space
+/// keyboard server reads port 0x60 itself (it holds a TSS I/O grant for
+/// 0x60/0x64, installed at spawn). This handler only forwards the IRQ
+/// notification and the PIC EOI.
 ///
-/// This must execute quickly — the PS/2 controller only buffers one byte.
-/// If a second keystroke arrives before we read port 0x60, the first is
-/// lost. In practice, even with IPC and scheduling overhead, we're well
-/// within the ~16ms between keystrokes at peak typing speed.
+/// # Accepted race
+///
+/// If a second keystroke arrives before the server drains port 0x60, the
+/// first byte is lost. At human typing speed the server (woken by this very
+/// notification) always wins; only a synthetic key-burst faster than a
+/// schedule slice could drop a byte.
 #[no_mangle]
 pub unsafe extern "C" fn keyboard_irq_handler() {
-    // ── Step 1: Read scancode from PS/2 data port ──
-    // Port 0x60 is the PS/2 data port. Reading it gives us the scancode
-    // of the most recent key press or release. The `in` instruction is
-    // privileged — only ring 0 code can execute it. This is why the
-    // keyboard server (which runs at ring 3) can't read it directly.
-    let scancode: u8;
-    core::arch::asm!("in al, 0x60", out("al") scancode, options(nostack));
-
-    // ── Step 2: Forward raw scancode through interrupt server ──
-    // Instead of pushing directly to the keyboard server, we go through
-    // the interrupt server (or its backward-compatible fallback).
-    // This enables the true microkernel IRQ routing path.
+    // ── Step 1: notify, don't read ──
+    // Empty payload: the scancode is NOT here. The keyboard server reads
+    // port 0x60 from ring 3 when this notification arrives (via the ISR as
+    // MSG_KEY_SCANCODE, or directly when user-space routing is off).
     {
-        let mut data = [0u8; 60];
-        data[0] = scancode;
+        let data = [0u8; 60];
         crate::interrupt_server::forward_irq(1 /* keyboard IRQ */, &data);
     }
 
-    // ── Step 3: Send End-Of-Interrupt to the master PIC ──
+    // ── Step 2: Send End-Of-Interrupt to the master PIC ──
     // Writing 0x20 to port 0x20 tells the 8259A PIC that we've finished
     // handling this interrupt. Without this, the PIC won't deliver any
     // more interrupts (including timer ticks — the system freezes).
@@ -1438,6 +1797,13 @@ pub unsafe fn init_idt() {
     let gp_addr = &gp_entry as *const u8 as u64;
     let gp_idt_entry = IdtEntry::new(gp_addr, 0x08);
     idt.add(0x0D).write(gp_idt_entry);
+
+    // Vectors 0x2E/0x2F: ATA disk completion IRQs — acknowledge and ignore
+    // (the user-space driver polls; see irq14_entry).
+    let irq14_addr = &irq14_entry as *const u8 as u64;
+    idt.add(0x2E).write(IdtEntry::new(irq14_addr, 0x08));
+    let irq15_addr = &irq15_entry as *const u8 as u64;
+    idt.add(0x2F).write(IdtEntry::new(irq15_addr, 0x08));
 
     // Vector 0x08: Double Fault — diagnostic with IST1
     let df_addr = &df_entry as *const u8 as u64;

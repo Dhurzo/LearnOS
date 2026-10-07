@@ -320,27 +320,14 @@ pub extern "C" fn _start() -> ! {
     // ============================================================================
     // STEP 1c: DISCOVER STORAGE RESOURCES FOR THE USER-SPACE DRIVER
     // ============================================================================
-    // The kernel only enumerates the PCI resource and reserves DMA memory. The
-    // VirtIO request protocol and FAT parser run in the user-space storage server.
+    // The kernel only names the storage resource and reserves nothing: the
+    // ISA IDE interface uses fixed register ports, and the ATA protocol and
+    // FAT parser run in the user-space storage server. A legacy virtio-blk
+    // function, if present, is preferred for its BAR0 discovery; otherwise
+    // the fixed IDE ports are used.
     let storage_resources = match pci::probe_virtio_io_base() {
-        Some(io_base) => match paging::alloc_contiguous_frames(paging::DMA_QUEUE_PAGES) {
-            Some(queue_phys) => {
-                vga::serial_print("[pci] virtio-blk BAR0=");
-                vga::serial_print_hex("", io_base as u64);
-                vga::serial_print(" queue=");
-                vga::serial_print_hex("", queue_phys);
-                vga::serial_print("\n");
-                Some((io_base, queue_phys))
-            }
-            None => {
-                vga::serial_print("[pci] no contiguous DMA frames; storage server disabled\n");
-                None
-            }
-        },
-        None => {
-            vga::serial_print("[pci] no legacy virtio-blk; storage server disabled\n");
-            None
-        }
+        Some(io_base) => Some((io_base, 0)),
+        None => Some((pci::IDE_DATA_PORT, 0)), // ISA-style IDE is always present
     };
 
     // ============================================================================
@@ -405,6 +392,12 @@ pub extern "C" fn _start() -> ! {
             // process gets a coherent screen buffer. Here we only register the PID
             // so sys_vga_write can forward writes via IPC.
             crate::syscall::set_vga_server_pid(vga_pid);
+            // Grant the display server the COM1 serial port range so it can
+            // mirror rendered characters to the host console (observable
+            // user-space output; the driver owns the port I/O itself).
+            if let Some(server) = pt.get_mut(vga_pid) {
+                server.grant_io_ports(0x3F8, 8);
+            }
             // Leave every new process READY. schedule_init selects exactly one
             // initial RUNNING process after all services have been created.
             // Write 'V' for VGA server
@@ -432,6 +425,14 @@ pub extern "C" fn _start() -> ! {
         // --- Spawn keyboard server (loaded from embedded ELF) ---
         if let Some(kbd_pid) = pt.spawn_from_elf("keyboard", crate::server_images::KEYBOARD_ELF) {
             crate::syscall::set_keyboard_server_pid(kbd_pid);
+            if let Some(server) = pt.get_mut(kbd_pid) {
+                server.grant_io_ports(0x3F8, 8);
+                // A1: the keyboard server owns the PS/2 ports — data (0x60)
+                // and status (0x64) — so it can drain scancodes from ring 3.
+                // The kernel IRQ handler only forwards the notification.
+                server.grant_io_ports(0x60, 1);
+                server.grant_io_ports(0x64, 1);
+            }
             // The keyboard server self-registers with the interrupt server (ISR)
             // at startup via MSG_IRQ_REGISTER; the kernel no longer tracks its
             // handler here. See userspace/src/bin/keyboard.rs.
@@ -457,6 +458,16 @@ pub extern "C" fn _start() -> ! {
             vga::serial_print("Shell PID ");
             vga::serial_print_hex("", shell_pid as u64);
             vga::serial_print(" READY\n");
+            // Least privilege in action: only the shell may replace its own
+            // image (C1 `run`), so only it receives the EXEC capability.
+            if let Some(shell) = pt.get_mut(shell_pid) {
+                unsafe {
+                    crate::capability::grant(
+                        &mut shell.capabilities,
+                        crate::capability::cap_id::EXEC,
+                    );
+                }
+            }
             // Write 'S' for Shell
             unsafe {
                 core::ptr::write_volatile(0xB800E as *mut u8, b'S');
@@ -464,34 +475,42 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        // The storage server owns the legacy VirtIO protocol and FAT policy in
-        // user space. The kernel grants only this process the discovered BAR0
-        // ports and maps its two physically contiguous queue pages.
+        // The storage server owns the ATA protocol and FAT policy in
+        // user space. The kernel grants only this process the register
+        // ports (fixed IDE ports, or a discovered virtio BAR0).
         if let Some((io_base, queue_phys)) = storage_resources {
             if let Some(storage_pid) = pt.spawn_from_elf(
                 "storage-server",
                 crate::server_images::FS_SERVER_ELF,
             ) {
                 let mut mapped = true;
-                for page in 0..paging::DMA_QUEUE_PAGES as u64 {
-                    mapped &= unsafe {
-                        paging::map_phys_page(
-                            pt.get(storage_pid).unwrap().cr3,
-                            paging::DMA_QUEUE_VADDR + page * paging::PAGE_SIZE,
-                            queue_phys + page * paging::PAGE_SIZE,
-                            paging::page_flags::PRESENT
-                                | paging::page_flags::WRITABLE
-                                | paging::page_flags::USER_ACCESS
-                                | paging::page_flags::EXECUTABLE_DISABLE,
-                        )
-                    };
+                if queue_phys != 0 {
+                    for page in 0..paging::DMA_QUEUE_PAGES as u64 {
+                        mapped &= unsafe {
+                            paging::map_phys_page(
+                                pt.get(storage_pid).unwrap().cr3,
+                                paging::DMA_QUEUE_VADDR + page * paging::PAGE_SIZE,
+                                queue_phys + page * paging::PAGE_SIZE,
+                                paging::page_flags::PRESENT
+                                    | paging::page_flags::WRITABLE
+                                    | paging::page_flags::USER_ACCESS
+                                    | paging::page_flags::EXECUTABLE_DISABLE,
+                            )
+                        };
+                    }
                 }
                 if mapped {
                     if let Some(server) = pt.get_mut(storage_pid) {
-                        let granted = server.grant_io_ports(
-                            io_base,
-                            pci::VIRTIO_LEGACY_IO_PORT_LEN,
-                        );
+                        let port_len =
+                            if io_base == pci::IDE_DATA_PORT { pci::IDE_IO_PORT_LEN } else { pci::VIRTIO_LEGACY_IO_PORT_LEN };
+                        let granted = server.grant_io_ports(io_base, port_len);
+                        vga::serial_print("[pci] storage io_base=");
+                        vga::serial_print_hex("", io_base as u64);
+                        vga::serial_print(" len=");
+                        vga::serial_print_hex("", port_len as u64);
+                        vga::serial_print(" granted=");
+                        vga::serial_print_hex("", if granted { 1 } else { 0 });
+                        vga::serial_print("\n");
                         let mut data = [0u8; 60];
                         data[..2].copy_from_slice(&io_base.to_le_bytes());
                         data[2..10].copy_from_slice(&queue_phys.to_le_bytes());
@@ -551,6 +570,19 @@ pub extern "C" fn _start() -> ! {
             "in al, 0x21",      // Read current mask
             "and al, 0xFC",     // Clear bits 0 (timer) and 1 (keyboard)
             "out 0x21, al",     // Write back — all other IRQs masked
+            options(nostack),
+        );
+    }
+
+    // Mask ATA disk IRQ14/IRQ15 on the slave PIC (set bits 6 and 7). SeaBIOS
+    // leaves them unmasked and the disk raises them on every command
+    // completion; the user-space storage driver polls the status register
+    // instead, so these interrupts would only vector into the ignore stubs.
+    unsafe {
+        core::arch::asm!(
+            "in al, 0xA1",
+            "or al, 0xC0",      // Mask bits 6 (IRQ14) and 7 (IRQ15)
+            "out 0xA1, al",
             options(nostack),
         );
     }

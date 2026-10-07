@@ -30,6 +30,33 @@ pub mod cap_id {
     pub const IRQ_REGISTER: usize = 6;
 }
 
+/// Per-endpoint capability table: which capability bit guards IPC sends to
+/// each well-known server PID. Endpoints not listed here (drivers, including
+/// the storage server) fall back to `DRIVER_SEND`.
+///
+/// Centralising the mapping in one table (instead of scattering `match`es
+/// across syscalls) means adding a server only touches this table.
+pub const ENDPOINT_CAPS: [(u16, usize); 2] = [
+    (1, cap_id::VGA_SEND),
+    (2, cap_id::KEYBOARD_SEND),
+];
+
+/// Capability required to send an IPC message to `dst_pid`.
+pub fn endpoint_cap(dst_pid: u16) -> usize {
+    for &(pid, cap) in ENDPOINT_CAPS.iter() {
+        if pid == dst_pid {
+            return cap;
+        }
+    }
+    cap_id::DRIVER_SEND
+}
+
+/// Delegation rule for `SYS_GRANT_CAP`: a process may only grant capability
+/// bits it holds itself. Pure predicate so it is unit-testable on the host.
+pub fn can_grant(caller_caps: u64, cap: usize) -> bool {
+    cap < MAX_CAPABILITIES && has(caller_caps, cap)
+}
+
 /// Grant a capability bit to the process's bitmap.
 ///
 /// # Safety
@@ -65,22 +92,67 @@ pub fn has(proc_caps: u64, cap: usize) -> bool {
 ///
 /// This is called by `sys_ipc_send` during Phase 4 hardening. If the sender
 /// does not hold a capability for the target endpoint type, the message
-/// is rejected at the syscall boundary.
+/// is rejected at the syscall boundary with `EACCES` (-2).
 ///
-/// # Mapping rules
+/// # Mapping rules (see [`ENDPOINT_CAPS`])
 /// - PID 0 (kernel) — always permitted
-/// - PID 1 → `VGA_SEND`
-/// - PID 2 → `KEYBOARD_SEND`
+/// - Well-known servers → their table entry
 /// - All other PIDs → `DRIVER_SEND`
 pub fn check_ipc_send(sender_caps: u64, dst_pid: u16) -> bool {
     // PID 0 is kernel — always allowed
     if dst_pid == 0 {
         return true;
     }
-    let required_cap = match dst_pid {
-        1 => cap_id::VGA_SEND,
-        2 => cap_id::KEYBOARD_SEND,
-        _ => cap_id::DRIVER_SEND,
-    };
-    has(sender_caps, required_cap)
+    has(sender_caps, endpoint_cap(dst_pid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_table_maps_well_known_servers() {
+        assert_eq!(endpoint_cap(1), cap_id::VGA_SEND);
+        assert_eq!(endpoint_cap(2), cap_id::KEYBOARD_SEND);
+        // Drivers (storage, ISR, forks) fall back to DRIVER_SEND.
+        assert_eq!(endpoint_cap(3), cap_id::DRIVER_SEND);
+        assert_eq!(endpoint_cap(6), cap_id::DRIVER_SEND);
+        assert_eq!(endpoint_cap(0xFFFF), cap_id::DRIVER_SEND);
+    }
+
+    #[test]
+    fn grant_has_roundtrip_and_bounds() {
+        let mut caps = 0u64;
+        assert!(unsafe { grant(&mut caps, cap_id::VGA_SEND) });
+        assert!(has(caps, cap_id::VGA_SEND));
+        assert!(!has(caps, cap_id::KEYBOARD_SEND));
+        // Out-of-range bits are rejected everywhere.
+        assert!(!unsafe { grant(&mut caps, MAX_CAPABILITIES) });
+        assert!(!has(caps, MAX_CAPABILITIES));
+        assert!(unsafe { revoke(&mut caps, cap_id::VGA_SEND) });
+        assert!(!has(caps, cap_id::VGA_SEND));
+    }
+
+    #[test]
+    fn delegation_requires_holding_the_cap() {
+        let holder = 1u64 << cap_id::DRIVER_SEND;
+        assert!(can_grant(holder, cap_id::DRIVER_SEND));
+        assert!(!can_grant(holder, cap_id::EXEC));
+        assert!(!can_grant(holder, MAX_CAPABILITIES));
+        assert!(!can_grant(0, cap_id::VGA_SEND));
+    }
+
+    #[test]
+    fn check_ipc_send_matrix() {
+        let all = u64::MAX;
+        assert!(check_ipc_send(0, 0)); // kernel endpoint always open
+        assert!(check_ipc_send(all, 1));
+        assert!(check_ipc_send(all, 2));
+        assert!(check_ipc_send(all, 9));
+        let vga_only = 1u64 << cap_id::VGA_SEND;
+        assert!(check_ipc_send(vga_only, 1));
+        assert!(!check_ipc_send(vga_only, 2));
+        assert!(!check_ipc_send(vga_only, 6));
+        assert!(!check_ipc_send(0, 1));
+    }
 }

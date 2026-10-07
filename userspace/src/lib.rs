@@ -117,17 +117,210 @@ pub mod syscall_nr {
     pub const BRK: usize = 5;
     pub const GETPID: usize = 6;
     pub const VGA_WRITE: usize = 7;
+    pub const VGA_CLEAR: usize = 8;
     pub const SCHEDULE: usize = 9;
     // GET_SERVER_PID (10): return the PID of a well-known server process.
     //   1 = VGA display server, 2 = Keyboard input server.
     // Exposed so user-space servers can discover each other's PIDs without
     // hardcoding them — mirrors kernel/src/syscall.rs::sys_get_server_pid.
     pub const GET_SERVER_PID: usize = 10;
+    // GRANT_CAP (19): delegate a held capability bit to another process.
+    pub const GRANT_CAP: usize = 19;
+    // KILL (20): send a signal to another process.
+    pub const KILL: usize = 20;
+    // EXEC (21): replace this process's image with the ELF at a user buffer.
+    pub const EXEC: usize = 21;
+}
+
+/// Permission denied: the caller lacks the capability for the requested
+/// endpoint or operation (mirrors the kernel's EACCES).
+pub const EACCES: isize = -2;
+
+/// Well-known signal numbers (mirrors `kernel/src/signal.rs::sig_num`).
+pub mod sig {
+    pub const SIGTERM: usize = 5;
+    pub const SIGSTOP: usize = 9;
+    pub const SIGCONT: usize = 10;
 }
 
 // Re-export the raw syscall wrappers at the crate root for ergonomic use by
 // server binaries (e.g. `use userspace::{syscall0, syscall_nr};`).
 pub use syscall::{syscall0, syscall1, syscall2};
+
+/// Tiny file-service protocol between the shell and the storage server.
+///
+/// The storage server owns the FAT parser and the block driver; the shell
+/// asks it for directory listings and file chunks over IPC. Fixed 64-byte
+/// messages, little-endian integers, 8.3 upper-case names.
+pub mod fs_proto {
+    /// Shell → storage: list the root directory.
+    pub const LIST: u16 = 0x40;
+    /// Storage → shell: one directory entry.
+    /// `data[0..11]` = raw 8.3 name, `data[11..15]` = size u32 LE,
+    /// `data[15..17]` = first cluster u16 LE, `data[17]` = 1 if dir.
+    pub const ENTRY: u16 = 0x41;
+    /// Storage → shell: end of listing.
+    pub const END: u16 = 0x42;
+    /// Shell → storage: read file bytes.
+    /// `data[0..11]` = raw 8.3 name, `data[12..16]` = offset u32 LE,
+    /// `data[16..20]` = length u32 LE (clamped to DATA_MAX).
+    pub const READ: u16 = 0x43;
+    /// Storage → shell: file bytes.
+    /// `data[0..4]` = byte count u32 LE (READ_ERROR on failure),
+    /// `data[4..60]` = up to DATA_MAX bytes.
+    pub const DATA: u16 = 0x44;
+    /// `DATA` count value meaning "no such file / too big".
+    pub const READ_ERROR: u32 = 0xFFFF_FFFF;
+    /// Largest payload one `DATA` message can carry.
+    pub const DATA_MAX: usize = 56;
+    /// Largest file the storage server will stage for a `READ` (16 KiB).
+    pub const MAX_STAGED: usize = 16 * 1024;
+}
+
+/// Shell command-line parsing and number conversion (pure, no syscalls).
+///
+/// Lives in the runtime so it is unit-testable on the host; the shell binary
+/// itself is `no_std` without a test harness.
+pub mod cmd {
+    /// Maximum arguments per line (including the command).
+    pub const MAX_ARGS: usize = 8;
+    /// Maximum bytes per argument.
+    pub const MAX_ARG_LEN: usize = 32;
+
+    /// Split `line` on ASCII whitespace into `argv`/`lens`.
+    ///
+    /// Returns the argument count (0 for a blank line). Arguments longer
+    /// than `MAX_ARG_LEN` are truncated; extras beyond `MAX_ARGS` are
+    /// dropped. Never fails — callers dispatch on `argv[0]` when `argc > 0`.
+    pub fn parse_line(line: &[u8], argv: &mut [[u8; MAX_ARG_LEN]; MAX_ARGS], lens: &mut [usize; MAX_ARGS]) -> usize {
+        let mut argc = 0;
+        let mut i = 0;
+        while i < line.len() && argc < MAX_ARGS {
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t' || line[i] == b'\n' || line[i] == b'\r') {
+                i += 1;
+            }
+            if i >= line.len() {
+                break;
+            }
+            let mut len = 0;
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' && line[i] != b'\n' && line[i] != b'\r' {
+                if len < MAX_ARG_LEN {
+                    argv[argc][len] = line[i];
+                    len += 1;
+                }
+                i += 1;
+            }
+            lens[argc] = len;
+            argc += 1;
+        }
+        argc
+    }
+
+    /// Parse an ASCII decimal number. Returns `None` on empty input,
+    /// non-digit bytes, or overflow past `u32`.
+    pub fn atoi(s: &[u8]) -> Option<u32> {
+        if s.is_empty() {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for &b in s.iter() {
+            if b < b'0' || b > b'9' {
+                return None;
+            }
+            v = v.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+        }
+        Some(v)
+    }
+
+    /// Convert a command-line file name to raw 8.3 bytes (upper-cased,
+    /// space-padded). `"runme"` → `RUNME   ` + `   `; `"a.elf"` → `A` + `ELF`.
+    pub fn to_83(name: &[u8]) -> [u8; 11] {
+        let mut out = [b' '; 11];
+        let mut dot = None;
+        for (i, &b) in name.iter().enumerate() {
+            if b == b'.' {
+                dot = Some(i);
+                break;
+            }
+        }
+        let (base, ext) = match dot {
+            Some(d) => (&name[..d], &name[d + 1..]),
+            None => (name, &[][..]),
+        };
+        for (i, &b) in base.iter().take(8).enumerate() {
+            out[i] = ascii_up(b);
+        }
+        for (i, &b) in ext.iter().take(3).enumerate() {
+            out[8 + i] = ascii_up(b);
+        }
+        out
+    }
+
+    fn ascii_up(b: u8) -> u8 {
+        if b >= b'a' && b <= b'z' {
+            b - 32
+        } else {
+            b
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn parse(s: &[u8]) -> ([[u8; MAX_ARG_LEN]; MAX_ARGS], [usize; MAX_ARGS], usize) {
+            let mut argv = [[0u8; MAX_ARG_LEN]; MAX_ARGS];
+            let mut lens = [0usize; MAX_ARGS];
+            let argc = parse_line(s, &mut argv, &mut lens);
+            (argv, lens, argc)
+        }
+
+        fn arg<'a>(argv: &'a [[u8; MAX_ARG_LEN]; MAX_ARGS], lens: &[usize], i: usize) -> &'a [u8] {
+            &argv[i][..lens[i]]
+        }
+
+        #[test]
+        fn splits_words_and_skips_blanks() {
+            let (argv, lens, argc) = parse(b"  cat   README  \n");
+            assert_eq!(argc, 2);
+            assert_eq!(arg(&argv, &lens, 0), b"cat");
+            assert_eq!(arg(&argv, &lens, 1), b"README");
+            let (_, _, argc) = parse(b"   \n");
+            assert_eq!(argc, 0);
+        }
+
+        #[test]
+        fn truncates_long_args_and_caps_argc() {
+            let (argv, lens, argc) = parse(b"echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            assert_eq!(argc, 2);
+            assert_eq!(lens[1], MAX_ARG_LEN);
+            let mut many = [b'a'; 64];
+            for i in (0..64).step_by(2) {
+                many[i] = b' ';
+            }
+            let (_, _, argc2) = parse(&many);
+            assert!(argc2 <= MAX_ARGS);
+        }
+
+        #[test]
+        fn atoi_accepts_decimals_rejects_junk() {
+            assert_eq!(atoi(b"0"), Some(0));
+            assert_eq!(atoi(b"42"), Some(42));
+            assert_eq!(atoi(b"007"), Some(7));
+            assert_eq!(atoi(b""), None);
+            assert_eq!(atoi(b"4x"), None);
+            assert_eq!(atoi(b"-1"), None);
+            assert_eq!(atoi(b"99999999999"), None);
+        }
+
+        #[test]
+        fn to_83_pads_and_upcases() {
+            assert_eq!(to_83(b"runme"), *b"RUNME      ");
+            assert_eq!(to_83(b"a.elf"), *b"A       ELF");
+            assert_eq!(to_83(b"README"), *b"README     ");
+        }
+    }
+}
 
 /// Size of a single IPC message in bytes (fixed-size), matching the kernel.
 pub const IPC_MSG_SIZE: usize = 64;
@@ -216,6 +409,12 @@ pub unsafe fn vga_write(ch: usize) -> isize {
     syscall::syscall1(syscall_nr::VGA_WRITE, ch)
 }
 
+/// Clear the screen via the VGA display server (VGA_CLEAR, nr 8).
+#[inline]
+pub unsafe fn vga_clear() -> isize {
+    syscall::syscall0(syscall_nr::VGA_CLEAR)
+}
+
 /// Return the PID of a well-known server process (GET_SERVER_PID, nr 10).
 ///
 ///   `server` = 1 → VGA display server, 2 → Keyboard input server.
@@ -224,6 +423,78 @@ pub unsafe fn vga_write(ch: usize) -> isize {
 #[inline]
 pub unsafe fn get_server_pid(server: usize) -> isize {
     syscall::syscall1(syscall_nr::GET_SERVER_PID, server)
+}
+
+/// Delegate a held capability bit to another process (GRANT_CAP, nr 19).
+///
+/// Returns 0 on success, -1 on malformed arguments, EACCES (-2) when the
+/// caller does not hold the bit itself.
+#[inline]
+pub unsafe fn grant_cap(dst_pid: usize, cap: usize) -> isize {
+    syscall::syscall2(syscall_nr::GRANT_CAP, dst_pid, cap)
+}
+
+/// Send a signal to another process (KILL, nr 20).
+///
+/// Returns 0 on success, -1 on unknown PID or out-of-range signal.
+#[inline]
+pub unsafe fn kill(pid: usize, sig: usize) -> isize {
+    syscall::syscall2(syscall_nr::KILL, pid, sig)
+}
+
+/// Replace this process's image with the ELF found at `buf` (`len` bytes).
+///
+/// On success this never returns: execution restarts at the new entry point
+/// with a fresh stack. Returns a negative value on failure (bad image, bad
+/// range) and the current image keeps running.
+#[inline]
+pub unsafe fn exec(buf: usize, len: usize) -> isize {
+    syscall::syscall2(syscall_nr::EXEC, buf, len)
+}
+
+/// Adjust the process break (heap end) to `addr` (BRK, nr 5).
+///
+/// `addr == 0` queries the current break without changing it. Returns the
+/// (possibly new) break address, or -1 on failure.
+#[inline]
+pub unsafe fn sys_brk(addr: usize) -> isize {
+    syscall::syscall1(syscall_nr::BRK, addr)
+}
+
+/// Minimal bump allocator on top of `BRK` (no `free`).
+///
+/// One 8-aligned bump pointer per process; the kernel maps fresh zeroed
+/// pages as the break advances. Enough for a shell that needs a
+/// file-sized buffer once per command — a real allocator can replace
+/// this module without touching callers.
+pub mod heap {
+    static mut HEAP_PTR: usize = 0;
+
+    /// Reserve `size` bytes and return their address, or 0 on failure.
+    pub unsafe fn alloc(size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+        let size = (size + 7) & !7;
+        if HEAP_PTR == 0 {
+            let cur = super::sys_brk(0);
+            if cur <= 0 {
+                return 0;
+            }
+            HEAP_PTR = cur as usize;
+        }
+        let base = HEAP_PTR;
+        let new_end = match base.checked_add(size) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let got = super::sys_brk(new_end);
+        if got < 0 || (got as usize) < new_end {
+            return 0;
+        }
+        HEAP_PTR = new_end;
+        base
+    }
 }
 
 // The entry point must be assembly, not an ordinary Rust function: Rust inline

@@ -95,7 +95,7 @@
 //!
 //! =============================================================================
 
-use crate::paging::{self, MemoryRegion, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START, USER_VADDR_END};
+use crate::paging::{self, MemoryRegion, USER_HEAP_START, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START, USER_VADDR_END};
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// User PID pool size (max concurrent user processes)
@@ -160,7 +160,7 @@ pub fn free_user_pid_slot(pid: u16) {
 pub const IPC_MSG_SIZE: usize = 64;
 
 /// Number of messages per-process queue.
-pub const IPC_QUEUE_CAPACITY: usize = 16;
+pub const IPC_QUEUE_CAPACITY: usize = 64;
 
 /// Ensure each IpcMessage is exactly 64 bytes.
 #[allow(unused)]
@@ -205,6 +205,7 @@ pub enum ProcessState {
     Ready,      // Process is ready to run
     Running,    // Process is executing
     Blocked,    // Process is waiting for I/O
+    Stopped,    // Suspended by SIGSTOP — scheduler skips until SIGCONT
     Terminated, // Process has finished
 }
 
@@ -271,6 +272,10 @@ pub struct Process {
     /// bitmap is rebuilt from this list whenever the scheduler switches tasks.
     pub io_port_ranges: [crate::tss::IoPortRange; MAX_IO_PORT_RANGES],
     pub io_port_range_count: usize,
+
+    // C3 — User heap top (exclusive), managed by `BRK` (syscall 5).
+    // Starts at `USER_HEAP_START` with nothing mapped.
+    pub heap_end: u64,
 }
 
 /// ============================================================================
@@ -350,6 +355,7 @@ impl Process {
             capabilities: 0,
             io_port_ranges: [crate::tss::IoPortRange::EMPTY; MAX_IO_PORT_RANGES],
             io_port_range_count: 0,
+            heap_end: USER_HEAP_START,
         };
         // Phase 3 regression fix: grant the baseline set of user capabilities so
         // that generic IPC works. The capability model is dead code unless
@@ -718,9 +724,9 @@ impl ProcessTable {
     /// Returns the child's PID, or `None` if the process table is full.
     pub fn fork_process(&mut self, parent_pid: Pid) -> Option<Pid> {
         // Extract parent data before any mutable access to self
-        let (parent_entry, parent_name, parent_cr3, parent_regs) = {
+        let (parent_entry, parent_name, parent_cr3, parent_regs, parent_heap_end) = {
             let parent = self.get(parent_pid)?;
-            (parent.entry_point, parent.name, parent.cr3, parent.registers)
+            (parent.entry_point, parent.name, parent.cr3, parent.registers, parent.heap_end)
         };
 
         let child_pid = self.next_pid;
@@ -745,6 +751,9 @@ impl ProcessTable {
         let mut child = Process::new(child_pid, parent_entry, parent_name);
         child.registers = parent_regs;
         child.cr3 = child_cr3;
+        // The address space is a COW copy, so the parent's heap pages are
+        // visible here too — carry the break over verbatim.
+        child.heap_end = parent_heap_end;
         child.kernel_stack_top = kernel_stack_top;
         child.state = ProcessState::Ready;
 
@@ -967,7 +976,7 @@ fn schedule_user(entry: u64, stack: u64, cr3: u64, kernel_stack_top: u64) {
             "push 0x23",        // SS = ring-3 data segment | RPL3
             "push {stack}",     // User RSP
             "push {rflags}",    // RFLAGS with IF=1 for interrupts
-            "push 0x1B",        // CS = ring-3 code segment | RPL3
+            "push 0x2B",        // CS = ring-3 code segment | RPL3
             "push {entry}",     // User RIP
 
             // Set data segments for user mode
