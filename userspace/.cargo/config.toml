@@ -1,17 +1,21 @@
 # Per-crate build config for userspace programs.
 #
 # NOTE: this crate is excluded from the root workspace so that cargo does NOT
-# inherit the root `.cargo/config.toml`, which hard-kernels the kernel's
-# linker script (`-Tkernel/src/linker.ld`). User images must instead be plain
-# ET_EXEC binaries loaded at 0x400000.
-
-[build]
-target = "x86_64-unknown-none"
+# inherit the root `.cargo/config.toml`, which hard-codes the kernel's linker
+# script (`-Tkernel/src/linker.ld`). User images must instead be plain
+# ET_EXEC binaries loaded at 0x10000000.
+#
+# The flags below apply ONLY to bare-metal builds (`--target
+# x86_64-unknown-none`). There is deliberately no `[build] target` key here:
+# pinning the default target to a bare-metal one would make `cargo test`
+# impossible in this crate, and the host test suite is part of the build
+# contract (`./test-all.sh`). Bare-metal images are always produced through
+# `userspace/build.sh`, which passes the target and the link flags explicitly.
 
 [target.x86_64-unknown-none]
 rustflags = [
-    "-C", "link-arg=-Ttext=0x400000",
+    "-C", "link-arg=--image-base=0x10000000",
     "-C", "link-arg=-no-pie",
-    "-C", "link-arg=-e _start",
+    "-C", "link-arg=-e", "-C", "link-arg=_start",
     "-C", "codegen-units=1",
 ]

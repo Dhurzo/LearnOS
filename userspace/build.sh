@@ -10,16 +10,15 @@
 #   ./build.sh vga --out kernel/src/server_elfs
 #     builds the `vga` image and copies the resulting ELF into the given dir.
 #
-# Why --config-path (hermetic build):
+# Why a scratch working directory (hermetic build):
 #   Cargo loads file-based .cargo/config.toml relative to the CWD and its
 #   ancestors, NOT the manifest's own directory. The repo root ships a
 #   .cargo/config.toml that injects the KERNEL linker script (`-Tkernel/src/
 #   linker.ld`) into every cargo invocation under it -- and when cargo runs
 #   build.sh from inside `kernel/build.rs`, that leaked flag reaches the
-#   userspace link step and fails. We sidestep all of this by writing our own
-#   config to a scratch file and pointing cargo at it with `--config-path`,
-#   which replaces the default config search entirely; every needed flag lives
-#   in that single file, so no ancestor config can leak in regardless of CWD.
+#   userspace link step and fails. We sidestep all of this by building from a
+#   scratch directory and passing every needed flag through `--config`, so no
+#   ancestor config can leak in regardless of CWD.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

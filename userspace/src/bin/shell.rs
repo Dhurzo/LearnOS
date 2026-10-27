@@ -8,9 +8,60 @@
 #![no_std]
 #![no_main]
 
-use userspace::{cmd, exec, fs_proto, get_server_pid, heap, ipc_recv, ipc_send, kill, sig, syscall0, syscall_nr, vga_clear, vga_write, IpcMessage};
+use userspace::{cmd, exec, fs_proto, get_server_pid, heap, ipc_recv_timeout, ipc_send, kill, msg, sig, syscall0, syscall_nr, vga_clear, vga_write, IpcMessage};
 
 const LINE_BUF_SIZE: usize = 128;
+
+/// Ticks (100 Hz) the shell waits for a key event before looping again.
+const KEY_WAIT_TICKS: usize = 20;
+/// Ticks (100 Hz) the shell waits for a reply from the storage server.
+const FS_WAIT_TICKS: usize = 200;
+
+/// Number of received-but-not-yet-consumed messages the shell can hold.
+///
+/// The shell multiplexes two conversations on a single IPC queue: key events
+/// from the keyboard server and replies from the storage server. A message
+/// that arrives while we are waiting for a *different* type is parked here so
+/// it is neither lost nor mistaken for the wrong reply.
+const INBOX_CAPACITY: usize = 16;
+
+/// Parked messages, used as a small FIFO ring.
+struct Inbox {
+    msgs: [Option<IpcMessage>; INBOX_CAPACITY],
+    head: usize,
+    tail: usize,
+}
+
+impl Inbox {
+    const fn new() -> Self {
+        Self {
+            msgs: [None; INBOX_CAPACITY],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    /// Park a message. Returns false when the inbox is full (message dropped).
+    fn push(&mut self, m: IpcMessage) -> bool {
+        let next = (self.tail + 1) % INBOX_CAPACITY;
+        if next == self.head {
+            return false;
+        }
+        self.msgs[self.tail] = Some(m);
+        self.tail = next;
+        true
+    }
+
+    /// Take the oldest parked message.
+    fn pop(&mut self) -> Option<IpcMessage> {
+        if self.head == self.tail {
+            return None;
+        }
+        let m = self.msgs[self.head].take();
+        self.head = (self.head + 1) % INBOX_CAPACITY;
+        m
+    }
+}
 
 fn print_char(ch: u8) {
     unsafe { let _ = vga_write(ch as usize); }
@@ -39,6 +90,53 @@ fn print_u32(mut n: u32) {
     }
 }
 
+/// Receive the next message whose type is one of `wanted`.
+///
+/// Messages of other types are parked in `inbox` and returned later, so the
+/// shell never loses a key event while it is waiting for a storage reply.
+/// Returns `None` when the wait times out.
+fn recv_matching(inbox: &mut Inbox, wanted: &[u16], timeout_ticks: usize) -> Option<IpcMessage> {
+    // First, look at what was parked earlier.
+    let mut parked: [Option<IpcMessage>; INBOX_CAPACITY] = [None; INBOX_CAPACITY];
+    let mut parked_len = 0usize;
+    while let Some(m) = inbox.pop() {
+        if wanted.contains(&m.msg_type) {
+            // Put back everything we did not need, in order.
+            for i in (0..parked_len).rev() {
+                inbox.push(parked[i].unwrap());
+            }
+            return Some(m);
+        }
+        parked[parked_len] = Some(m);
+        parked_len += 1;
+    }
+
+    let mut buf: IpcMessage = unsafe { core::mem::zeroed() };
+    loop {
+        let ret = unsafe { ipc_recv_timeout(&mut buf as *mut IpcMessage as usize, timeout_ticks) };
+        if ret <= 0 {
+            // Timeout (or error): nothing matched.
+            for i in (0..parked_len).rev() {
+                inbox.push(parked[i].unwrap());
+            }
+            return None;
+        }
+        if wanted.contains(&buf.msg_type) {
+            for i in (0..parked_len).rev() {
+                inbox.push(parked[i].unwrap());
+            }
+            return Some(buf);
+        }
+        // Not what we are waiting for: park it and keep waiting.
+        if !inbox.push(buf) {
+            for i in (0..parked_len).rev() {
+                inbox.push(parked[i].unwrap());
+            }
+            return None;
+        }
+    }
+}
+
 /// Ask the keyboard server for the next buffered key.
 ///
 /// Protocol:
@@ -47,16 +145,15 @@ fn print_u32(mut n: u32) {
 ///   3. If `reply.data[1] == 1`, `reply.data[0]` is the ASCII character.
 ///
 /// Returns `None` if no key is available or the request failed.
-fn get_key(kbd_pid: usize) -> Option<u8> {
+fn get_key(inbox: &mut Inbox, kbd_pid: usize) -> Option<u8> {
     // Send a key request to the keyboard server.
-    let req = IpcMessage::new(0, 4, [0u8; 60]); // MSG_KEY_REQUEST
+    let req = IpcMessage::new(0, msg::KEY_REQUEST, [0u8; 60]);
     if unsafe { ipc_send(kbd_pid, &req as *const IpcMessage as usize) } < 0 {
         return None;
     }
-    // Receive the reply.
-    let mut reply: IpcMessage = unsafe { core::mem::zeroed() };
-    let ret = unsafe { ipc_recv(&mut reply as *mut IpcMessage as usize) };
-    if ret > 0 && reply.msg_type == 5 && reply.data[1] == 1 {
+    // Receive the reply, ignoring (and parking) anything else.
+    let reply = recv_matching(inbox, &[msg::KEY_EVENT], KEY_WAIT_TICKS)?;
+    if reply.data[1] == 1 {
         Some(reply.data[0])
     } else {
         None
@@ -85,21 +182,17 @@ struct FsEntry {
 }
 
 /// List the root directory into `out`. Returns the entry count, or -1.
-fn fs_list(storage: usize, out: &mut [FsEntry]) -> isize {
+fn fs_list(inbox: &mut Inbox, storage: usize, out: &mut [FsEntry]) -> isize {
     let req = IpcMessage::new(0, fs_proto::LIST, [0u8; 60]);
     if !send_retry(storage, &req) {
         return -1;
     }
     let mut count = 0;
-    // SCHEDULE is a no-op hint (rotation comes from the 100 Hz timer), so a
-    // poll loop must SPAN several ticks to let the server answer: each
-    // iteration is two cheap syscalls (~1us), and a tick lands every 10 ms.
-    for _ in 0..200_000u32 {
-        let mut reply: IpcMessage = unsafe { core::mem::zeroed() };
-        if unsafe { ipc_recv(&mut reply as *mut IpcMessage as usize) } <= 0 {
-            unsafe { let _ = syscall0(syscall_nr::SCHEDULE); }
-            continue;
-        }
+    loop {
+        let reply = match recv_matching(inbox, &[fs_proto::ENTRY, fs_proto::END], FS_WAIT_TICKS) {
+            Some(r) => r,
+            None => return -1,
+        };
         match reply.msg_type {
             fs_proto::ENTRY => {
                 if count < out.len() {
@@ -114,12 +207,11 @@ fn fs_list(storage: usize, out: &mut [FsEntry]) -> isize {
             _ => {}
         }
     }
-    -1
 }
 
 /// Read up to `want` bytes of `name` at `off` into `dst`. Returns the byte
 /// count, or `fs_proto::READ_ERROR` on failure.
-fn fs_read_chunk(storage: usize, name: &[u8; 11], off: usize, want: usize, dst: *mut u8) -> u32 {
+fn fs_read_chunk(inbox: &mut Inbox, storage: usize, name: &[u8; 11], off: usize, want: usize, dst: *mut u8) -> u32 {
     let mut d = [0u8; 60];
     d[..11].copy_from_slice(name);
     d[12..16].copy_from_slice(&(off as u32).to_le_bytes());
@@ -128,49 +220,37 @@ fn fs_read_chunk(storage: usize, name: &[u8; 11], off: usize, want: usize, dst: 
     if !send_retry(storage, &req) {
         return fs_proto::READ_ERROR;
     }
-    for _ in 0..200_000u32 {
-        let mut reply: IpcMessage = unsafe { core::mem::zeroed() };
-        if unsafe { ipc_recv(&mut reply as *mut IpcMessage as usize) } <= 0 {
-            unsafe { let _ = syscall0(syscall_nr::SCHEDULE); }
-            continue;
-        }
-        if reply.msg_type == fs_proto::DATA {
-            let n = u32::from_le_bytes([reply.data[0], reply.data[1], reply.data[2], reply.data[3]]);
-            if n == fs_proto::READ_ERROR || n as usize > fs_proto::DATA_MAX {
-                return fs_proto::READ_ERROR;
-            }
-            unsafe {
-                core::ptr::copy_nonoverlapping(reply.data[4..].as_ptr(), dst, n as usize);
-            }
-            return n;
-        }
+    let reply = match recv_matching(inbox, &[fs_proto::DATA], FS_WAIT_TICKS) {
+        Some(r) => r,
+        None => return fs_proto::READ_ERROR,
+    };
+    let n = u32::from_le_bytes([reply.data[0], reply.data[1], reply.data[2], reply.data[3]]);
+    if n == fs_proto::READ_ERROR || n as usize > fs_proto::DATA_MAX {
+        return fs_proto::READ_ERROR;
     }
-    fs_proto::READ_ERROR
+    unsafe {
+        core::ptr::copy_nonoverlapping(reply.data[4..].as_ptr(), dst, n as usize);
+    }
+    n
 }
 
 /// Wait for one DATA reply (sent earlier as part of a pipelined batch) and
 /// copy its payload to `dst`. Messages arrive FIFO from a single sender, so
 /// the first DATA is the next chunk in order. Returns the byte count, or
 /// `fs_proto::READ_ERROR` on timeout/mismatch.
-fn recv_data_chunk(want: usize, dst: *mut u8) -> u32 {
-    for _ in 0..200_000u32 {
-        let mut reply: IpcMessage = unsafe { core::mem::zeroed() };
-        if unsafe { ipc_recv(&mut reply as *mut IpcMessage as usize) } <= 0 {
-            unsafe { let _ = syscall0(syscall_nr::SCHEDULE); }
-            continue;
-        }
-        if reply.msg_type == fs_proto::DATA {
-            let n = u32::from_le_bytes([reply.data[0], reply.data[1], reply.data[2], reply.data[3]]);
-            if n == fs_proto::READ_ERROR || n as usize > fs_proto::DATA_MAX || n as usize != want {
-                return fs_proto::READ_ERROR;
-            }
-            unsafe {
-                core::ptr::copy_nonoverlapping(reply.data[4..].as_ptr(), dst, n as usize);
-            }
-            return n;
-        }
+fn recv_data_chunk(inbox: &mut Inbox, want: usize, dst: *mut u8) -> u32 {
+    let reply = match recv_matching(inbox, &[fs_proto::DATA], FS_WAIT_TICKS) {
+        Some(r) => r,
+        None => return fs_proto::READ_ERROR,
+    };
+    let n = u32::from_le_bytes([reply.data[0], reply.data[1], reply.data[2], reply.data[3]]);
+    if n == fs_proto::READ_ERROR || n as usize > fs_proto::DATA_MAX || n as usize != want {
+        return fs_proto::READ_ERROR;
     }
-    fs_proto::READ_ERROR
+    unsafe {
+        core::ptr::copy_nonoverlapping(reply.data[4..].as_ptr(), dst, n as usize);
+    }
+    n
 }
 
 /// Print a raw 8.3 name as `BASE.EXT` (or `BASE` when the extension is blank).
@@ -194,9 +274,9 @@ fn print_83(raw: &[u8; 11]) {
     }
 }
 
-fn cmd_ls(storage: usize) {
+fn cmd_ls(inbox: &mut Inbox, storage: usize) {
     let mut entries = [FsEntry { raw: [0u8; 11], size: 0 }; 16];
-    let n = fs_list(storage, &mut entries);
+    let n = fs_list(inbox, storage, &mut entries);
     if n < 0 {
         print_str("ls: storage server did not answer\n");
         return;
@@ -210,12 +290,12 @@ fn cmd_ls(storage: usize) {
     }
 }
 
-fn cmd_cat(storage: usize, name_arg: &[u8]) {
+fn cmd_cat(inbox: &mut Inbox, storage: usize, name_arg: &[u8]) {
     let raw = cmd::to_83(name_arg);
     let mut off = 0usize;
     loop {
         let mut chunk = [0u8; fs_proto::DATA_MAX];
-        let n = fs_read_chunk(storage, &raw, off, fs_proto::DATA_MAX, chunk.as_mut_ptr());
+        let n = fs_read_chunk(inbox, storage, &raw, off, fs_proto::DATA_MAX, chunk.as_mut_ptr());
         if n == fs_proto::READ_ERROR {
             print_str("cat: no such file\n");
             return;
@@ -231,11 +311,11 @@ fn cmd_cat(storage: usize, name_arg: &[u8]) {
     print_char(b'\n');
 }
 
-fn cmd_run(storage: usize, name_arg: &[u8]) {
+fn cmd_run(inbox: &mut Inbox, storage: usize, name_arg: &[u8]) {
     let raw = cmd::to_83(name_arg);
     // Find the size first (LIST), so the heap buffer is exactly file-sized.
     let mut entries = [FsEntry { raw: [0u8; 11], size: 0 }; 16];
-    let n = fs_list(storage, &mut entries);
+    let n = fs_list(inbox, storage, &mut entries);
     if n < 0 {
         print_str("run: storage server did not answer\n");
         return;
@@ -286,7 +366,7 @@ fn cmd_run(storage: usize, name_arg: &[u8]) {
         for i in 0..batch {
             let o = off + i * fs_proto::DATA_MAX;
             let want = core::cmp::min(fs_proto::DATA_MAX, size - o);
-            let n = recv_data_chunk(want, (buf + o) as *mut u8);
+            let n = recv_data_chunk(inbox, want, (buf + o) as *mut u8);
             if n != want as u32 {
                 print_str("run: read failed off=");
                 print_u32(o as u32);
@@ -352,7 +432,7 @@ fn cmd_ps() {
     print_char(b'\n');
 }
 
-fn dispatch(storage: usize, argv: &[[u8; cmd::MAX_ARG_LEN]; cmd::MAX_ARGS], lens: &[usize; cmd::MAX_ARGS], argc: usize) {
+fn dispatch(inbox: &mut Inbox, storage: usize, argv: &[[u8; cmd::MAX_ARG_LEN]; cmd::MAX_ARGS], lens: &[usize; cmd::MAX_ARGS], argc: usize) {
     let cmd_name = &argv[0][..lens[0]];
     let arg = |i: usize| -> &[u8] {
         if i < argc {
@@ -362,12 +442,12 @@ fn dispatch(storage: usize, argv: &[[u8; cmd::MAX_ARG_LEN]; cmd::MAX_ARGS], lens
         }
     };
     if cmd_name == b"ls" {
-        cmd_ls(storage);
+        cmd_ls(inbox, storage);
     } else if cmd_name == b"cat" {
         if argc < 2 {
             print_str("usage: cat FILE\n");
         } else {
-            cmd_cat(storage, arg(1));
+            cmd_cat(inbox, storage, arg(1));
         }
     } else if cmd_name == b"echo" {
         for i in 1..argc {
@@ -385,7 +465,7 @@ fn dispatch(storage: usize, argv: &[[u8; cmd::MAX_ARG_LEN]; cmd::MAX_ARGS], lens
         if argc < 2 {
             print_str("usage: run FILE\n");
         } else {
-            cmd_run(storage, arg(1));
+            cmd_run(inbox, storage, arg(1));
         }
     } else if cmd_name == b"kill" {
         if argc < 2 {
@@ -436,11 +516,14 @@ pub extern "C" fn main() -> ! {
     let mut line_buf: [u8; LINE_BUF_SIZE] = [0; LINE_BUF_SIZE];
     let mut line_len: usize = 0;
 
+    // Messages received while waiting for a different kind (see `recv_matching`).
+    let mut inbox = Inbox::new();
+
     // Display initial prompt.
     print_str("Shell> ");
 
     loop {
-        if let Some(ch) = get_key(kbd_pid) {
+        if let Some(ch) = get_key(&mut inbox, kbd_pid) {
             match ch {
                 b'\n' | b'\r' => {
                     // Enter: run the line through the dispatcher.
@@ -453,7 +536,7 @@ pub extern "C" fn main() -> ! {
                         if s > 0 {
                             storage = s as usize;
                         }
-                        dispatch(storage, &argv, &lens, argc);
+                        dispatch(&mut inbox, storage, &argv, &lens, argc);
                     }
                     line_len = 0;
                     print_str("Shell> ");

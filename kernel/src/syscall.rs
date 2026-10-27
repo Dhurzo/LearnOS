@@ -637,9 +637,7 @@ fn sys_register_irq(vector: usize, handler_pid: usize, _a3: usize, _a4: usize, _
         handler_pid as u16
     };
     // Register with interrupt server
-    unsafe {
-        crate::interrupt_server::register_handler(vector as u8, pid);
-    }
+    crate::interrupt_server::register_handler(vector as u8, pid);
     crate::vga::serial_print("IRQ registered\n");
     0
 }

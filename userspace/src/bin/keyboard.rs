@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use userspace::{get_server_pid, ipc_recv, ipc_send, vga_write, syscall0, syscall_nr, IpcMessage};
+use userspace::{get_server_pid, ipc_recv, ipc_send, msg, vga_write, syscall0, syscall_nr, IpcMessage};
 
 /// PS/2 controller ports owned by this server (granted by the kernel).
 const PS2_DATA_PORT: u16 = 0x60;
@@ -48,7 +48,10 @@ fn read_scancode() -> Option<u8> {
     }
 }
 
-/// Handle one drained scancode byte: buffer make-codes, echo, drop the rest.
+/// Handle one drained scancode byte: buffer make-codes, drop the rest.
+///
+/// The server does NOT echo: the terminal owner (the shell) echoes what it
+/// receives. Echoing here as well would print every keystroke twice.
 fn handle_scancode(
     scancode: u8,
     key_buf: &mut [u8; KEY_BUF_CAPACITY],
@@ -66,9 +69,6 @@ fn handle_scancode(
             key_buf[*buf_tail] = ch;
             *buf_tail = next;
         }
-        // Echo the key to VGA so the user can see what they typed.
-        // The kernel forwards this via IPC to the VGA server.
-        unsafe { let _ = vga_write(ch as usize); }
     }
 }
 
@@ -166,7 +166,11 @@ pub extern "C" fn main() -> ! {
         let _ = vga_write(b'K' as usize);
         let _ = vga_write(b'D' as usize);
         let _ = vga_write(b' ' as usize);
-        let _ = vga_write((b'0' + isr_pid.min(9) as u8) as usize);
+        if isr_pid > 0 {
+            let _ = vga_write((b'0' + (isr_pid as u8).min(9)) as usize);
+        } else {
+            let _ = vga_write(b'-' as usize);
+        }
         let _ = vga_write(b'\n' as usize);
     }
     if isr_pid > 0 {
@@ -175,7 +179,7 @@ pub extern "C" fn main() -> ! {
         data[0] = 1; // IRQ number (keyboard line = 1)
         data[1] = my_pid as u8; // our PID, little-endian
         data[2] = (my_pid >> 8) as u8;
-        let reg = IpcMessage::new(0, 6, data); // MSG_IRQ_REGISTER
+        let reg = IpcMessage::new(0, msg::IRQ_REGISTER, data);
         unsafe { let _ = ipc_send(isr_pid as usize, &reg as *const IpcMessage as usize); }
     }
     // Drain any stale boot-time byte (see `drain_pending`) so the first real
@@ -188,51 +192,46 @@ pub extern "C" fn main() -> ! {
         drain_ready(&mut key_buf, &mut buf_head, &mut buf_tail);
 
         // Wait for the next IPC message.
-        let mut msg: IpcMessage = unsafe { core::mem::zeroed() };
-        let ret = unsafe { ipc_recv(&mut msg as *mut IpcMessage as usize) };
+        let mut event: IpcMessage = unsafe { core::mem::zeroed() };
+        let ret = unsafe { ipc_recv(&mut event as *mut IpcMessage as usize) };
         if ret <= 0 {
             // No message — yield CPU cooperatively instead of busy-waiting.
             unsafe { let _ = syscall0(syscall_nr::SCHEDULE); }
             continue;
         }
 
-        match msg.msg_type {
-            // ── MSG_KEY_SCANCODE (type 3): keyboard IRQ notification ──
+        match event.msg_type {
+            // ── MSG_KEY_SCANCODE: keyboard IRQ notification ──
             // The payload carries no scancode: the byte is still sitting in
             // the controller. Drain port 0x60 ourselves (ring 3, granted),
             // in a burst so a fast typist never overruns the 1-byte buffer.
-            3 => {
-                unsafe {
-                    let _ = vga_write(b'K' as usize);
-                    let _ = vga_write(b'3' as usize);
-                    let _ = vga_write(b' ' as usize);
-                }
+            msg::KEY_SCANCODE => {
                 drain_pending(&mut key_buf, &mut buf_head, &mut buf_tail);
             }
-            // ── MSG_KEY_REQUEST (type 4): a client wants a key ──
-            // Reply with type 5 (MSG_KEY_EVENT) addressed to the sender.
-            4 => {
+            // ── MSG_KEY_REQUEST: a client wants a key ──
+            // Reply with MSG_KEY_EVENT addressed to the sender.
+            msg::KEY_REQUEST => {
                 if buf_head != buf_tail {
                     // Key available: pop from ring buffer.
                     let ch = key_buf[buf_head];
                     buf_head = (buf_head + 1) % KEY_BUF_CAPACITY;
                     // Reply with key data (data[0] = char, data[1] = 1 = available).
-                    let reply = IpcMessage::new(0, 5, {
+                    let reply = IpcMessage::new(0, msg::KEY_EVENT, {
                         let mut d = [0u8; 60];
                         d[0] = ch;
                         d[1] = 1;
                         d
                     });
-                    unsafe { let _ = ipc_send(msg.src_pid as usize, &reply as *const IpcMessage as usize); }
+                    unsafe { let _ = ipc_send(event.src_pid as usize, &reply as *const IpcMessage as usize); }
                 } else {
                     // No key available: send empty reply (data[1] = 0 = none).
-                    let reply = IpcMessage::new(0, 5, {
+                    let reply = IpcMessage::new(0, msg::KEY_EVENT, {
                         let mut d = [0u8; 60];
                         d[0] = 0;
                         d[1] = 0;
                         d
                     });
-                    unsafe { let _ = ipc_send(msg.src_pid as usize, &reply as *const IpcMessage as usize); }
+                    unsafe { let _ = ipc_send(event.src_pid as usize, &reply as *const IpcMessage as usize); }
                 }
             }
             _ => {}

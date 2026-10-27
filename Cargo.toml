@@ -2,7 +2,7 @@
 members = ["kernel", "signal_state"]
 # `userspace` and `interrupt_server` are kept out of the workspace on purpose:
 # they are standalone no_std images built with their own linker flags (ET_EXEC
-# @ 0x400000) via `userspace/build.sh` / `interrupt_server/build.sh`. The root
+# @ 0x10000000) via `userspace/build.sh` / `interrupt_server/build.sh`. The root
 # `.cargo/config.toml` injects the kernel's linker script into every cargo
 # invocation under the repo, which would corrupt those user-space links.
 exclude = ["userspace", "interrupt_server"]

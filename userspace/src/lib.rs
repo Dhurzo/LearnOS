@@ -132,6 +132,27 @@ pub mod syscall_nr {
     pub const EXEC: usize = 21;
 }
 
+/// Well-known IPC message types shared by the kernel and the user servers.
+///
+/// These live in the runtime crate so every server speaks the same protocol;
+/// the kernel only knows the types it forwards itself (VGA output and the
+/// storage-resource hand-off).
+pub mod msg {
+    /// → VGA server: print one character (`data[0]`).
+    pub const VGA_CHAR: u16 = 1;
+    /// → VGA server: clear the screen.
+    pub const VGA_CLEAR: u16 = 2;
+    /// → keyboard server: a keyboard IRQ arrived (no payload).
+    pub const KEY_SCANCODE: u16 = 3;
+    /// → keyboard server: client wants the next buffered key.
+    pub const KEY_REQUEST: u16 = 4;
+    /// ← keyboard server: one key event (`data[0]` = char, `data[1]` = 1 if present).
+    pub const KEY_EVENT: u16 = 5;
+    /// → interrupt server: register an IRQ handler (`data[0]` = IRQ, `data[1..3]` = PID).
+    pub const IRQ_REGISTER: u16 = 6;
+}
+
+
 /// Permission denied: the caller lacks the capability for the requested
 /// endpoint or operation (mirrors the kernel's EACCES).
 pub const EACCES: isize = -2;
@@ -388,6 +409,24 @@ pub unsafe fn ipc_recv(buf_ptr: usize) -> isize {
     syscall::syscall1(syscall_nr::IPC_RECV, buf_ptr)
 }
 
+/// Receive an IPC message into the buffer at `buf_ptr` with timeout.
+///
+/// Kernel signature: `IPC_RECV(buf_ptr, timeout)` → `syscall2`. The kernel
+/// copies a message (up to 64 bytes) into the caller's buffer and returns its
+/// length. `timeout` is expressed in kernel ticks (100 Hz):
+
+///   * `timeout == 0` — poll: return immediately with `-1` if the queue is empty.
+///   * `timeout > 0`  — block until a message arrives or the deadline expires
+///     (the kernel returns `-1` on timeout).
+
+/// A blocking receive parks the caller: the kernel marks it `Blocked` and
+/// switches to another process, so a waiting client costs no CPU time.
+#[inline]
+pub unsafe fn ipc_recv_timeout(buf_ptr: usize, timeout: usize) -> isize {
+    syscall::syscall2(syscall_nr::IPC_RECV, buf_ptr, timeout)
+}
+
+
 /// Terminate the calling process and halt the system.
 ///
 /// Mirrors the kernel's `sys_exit`, which simply enters an infinite loop (no
@@ -502,7 +541,7 @@ pub mod heap {
 // This trampoline starts with the ELF loader's minimal stack, installs this
 // process's private high-canonical user stack, and only then calls its `main`.
 // Keeping it outside a Rust prologue also makes the SysV call alignment explicit.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 core::arch::global_asm!(
     ".globl _start",
     ".type _start, @function",
@@ -522,7 +561,7 @@ core::arch::global_asm!(
 /// Excluded from host test builds (`cfg(test)`), where std provides its own
 /// panic handler; otherwise the two `panic_impl` lang items collide.
 #[panic_handler]
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }

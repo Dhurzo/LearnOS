@@ -319,6 +319,16 @@ fn normalize_name(raw: &[u8; 11]) -> [u8; 11] {
     out
 }
 
+/// Compare two raw 8.3 names case-insensitively.
+///
+/// FAT16 stores names in upper case on most tools, but the on-disk bytes are
+/// untrusted input: a volume written by another tool may contain lower-case
+/// names. The storage server therefore compares names the same way the shell
+/// upper-cases them, so `cat readme` finds `README` on either kind of image.
+pub fn names_equal(a: &[u8; 11], b: &[u8; 11]) -> bool {
+    normalize_name(a) == normalize_name(b)
+}
+
 /// Convert a user-supplied name to the padded, upper-cased 8.3 on-disk form.
 fn to_83(name: &str) -> [u8; 11] {
     let mut out = [b' '; 11];
@@ -522,8 +532,22 @@ mod tests {
         assert_eq!(&out[..n], &content[..]);
     }
 
+    
+
+    #[test]
+    fn raw_name_comparison_is_case_insensitive() {
+        // The shell upper-cases the name it sends; the volume may store it in
+        // either case. Both must match.
+        let upper = *b"README     ";
+        let lower = *b"readme     ";
+        assert!(names_equal(&upper, &lower));
+        assert!(names_equal(&upper, &upper));
+        assert!(!names_equal(&upper, b"HELLO      "));
+    }
+
     #[test]
     fn read_file_clamps_to_output_buffer() {
+
         // A caller buffer SMALLER than the file must yield `out.len()` bytes,
         // not a slice-index panic: the on-disk size is untrusted input.
         let mut content = [0u8; 700];

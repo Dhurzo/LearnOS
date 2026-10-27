@@ -91,10 +91,10 @@ if [ -n "$DISK_IMAGE" ]; then
         echo "ERROR: disk image not found: $DISK_IMAGE"
         exit 1
     fi
-    # Force the transitional legacy interface this educational user-space
-    # driver implements: BAR0 I/O ports + a PFN-based virtqueue.
-    DISK_ARGS+=( -drive "if=none,id=learnos_disk,file=$DISK_IMAGE,format=raw" )
-    DISK_ARGS+=( -device "virtio-blk-pci,drive=learnos_disk,disable-modern=on" )
+    # The user-space storage driver speaks the ATA PIO transport over the
+    # fixed ISA task-file ports (0x1F0..0x1F7), so the image is attached as
+    # an IDE disk. A virtio-blk device would need its own user-space driver.
+    DISK_ARGS+=( -drive "file=$DISK_IMAGE,format=raw,if=ide" )
 fi
 
 if [ ! -f "$KERNEL" ]; then

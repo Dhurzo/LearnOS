@@ -95,7 +95,7 @@
 //!
 //! =============================================================================
 
-use crate::paging::{self, MemoryRegion, USER_HEAP_START, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START, USER_VADDR_END};
+use crate::paging::{self, MemoryRegion, USER_HEAP_START, USER_STACK_SIZE, USER_STACK_VADDR, USER_VADDR_START};
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// User PID pool size (max concurrent user processes)

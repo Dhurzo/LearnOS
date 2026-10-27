@@ -12,11 +12,18 @@
 #![no_main]
 
 use userspace::block_driver::{read_sector, last_reason, SECTOR_SIZE};
-use userspace::fs::Fat16;
+use userspace::fs::{names_equal, DirEntry, Fat16};
 use userspace::{fs_proto, ipc_recv, ipc_send, vga_write, syscall0, syscall_nr, IpcMessage, MSG_STORAGE_CONFIG};
 
 /// Staging area for file reads (16 KiB in .bss — mapped as part of our image).
 static mut FILE_BUF: [u8; fs_proto::MAX_STAGED] = [0; fs_proto::MAX_STAGED];
+
+/// Root-directory snapshot, taken once at boot.
+///
+/// The FAT16 image is read-only for the lifetime of the system, so the root
+/// directory is parsed once and reused: looking up a file no longer re-scans
+/// the directory (and re-reads its sectors) on every READ request.
+static mut ROOT_ENTRIES: [Option<DirEntry>; 64] = [None; 64];
 
 /// Print a byte string one character at a time via the VGA/serial forwarder.
 fn print(s: &[u8]) {
@@ -81,13 +88,10 @@ pub extern "C" fn main() -> ! {
             idle();
         }
         let io_base = u16::from_le_bytes([config.data[0], config.data[1]]);
-        let queue_phys = u64::from_le_bytes([
-            config.data[2], config.data[3], config.data[4], config.data[5],
-            config.data[6], config.data[7], config.data[8], config.data[9],
-        ]);
-        let ok = userspace::block_driver::init(io_base, queue_phys);
+        let io_len = u16::from_le_bytes([config.data[2], config.data[3]]);
+        let ok = userspace::block_driver::init(io_base, 0);
         if !ok {
-            print(b"VirtIO-blk initialization failed.\n");
+            print(b"ATA disk initialization failed.\n");
             idle();
         }
 
@@ -156,6 +160,12 @@ pub extern "C" fn main() -> ! {
                 print(b"\n");
             }
         }
+        // Keep the snapshot for the file-service loop below.
+        for i in 0..count.min(ROOT_ENTRIES.len()) {
+            unsafe {
+                ROOT_ENTRIES[i] = entries[i];
+            }
+        }
 
         // Read a file named "README" if present.
         match fat.find(&mut read, "README") {
@@ -185,9 +195,7 @@ pub extern "C" fn main() -> ! {
             let from = req.src_pid as usize;
             match req.msg_type {
                 fs_proto::LIST => {
-                    let mut entries = [None; 64];
-                    let count = fat.list_root(&mut read, &mut entries);
-                    for e in entries.iter().take(count).flatten() {
+                    for e in unsafe { (&raw const ROOT_ENTRIES).as_ref().unwrap().iter().flatten() } {
                         let mut d = [0u8; 60];
                         d[..11].copy_from_slice(&e.raw_name);
                         d[11..15].copy_from_slice(&e.size.to_le_bytes());
@@ -210,12 +218,11 @@ pub extern "C" fn main() -> ! {
                         len = fs_proto::DATA_MAX;
                     }
                     let mut d = [0u8; 60];
-                    // Locate the entry by raw 8.3 bytes (shell sends upper-case).
-                    let mut entries = [None; 64];
-                    let count = fat.list_root(&mut read, &mut entries);
+                    // Locate the entry by raw 8.3 bytes (case-insensitive: the
+                    // shell upper-cases the name, the volume may not).
                     let mut found = None;
-                    for e in entries.iter().take(count).flatten() {
-                        if e.raw_name == name {
+                    for e in unsafe { (&raw const ROOT_ENTRIES).as_ref().unwrap().iter().flatten() } {
+                        if names_equal(&e.raw_name, &name) {
                             found = Some(*e);
                             break;
                         }

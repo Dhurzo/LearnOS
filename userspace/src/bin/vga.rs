@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use userspace::{ipc_recv, syscall0, syscall_nr, IpcMessage};
+use userspace::{ipc_recv, msg, syscall0, syscall_nr, IpcMessage};
 
 /// Mirror output to COM1 serial so user-space rendering is observable from the
 /// host (`-serial mon:stdio`). The kernel initialized COM1 at boot and granted
@@ -60,8 +60,8 @@ pub extern "C" fn main() -> ! {
 
     loop {
         // Event-driven server: wait for IPC, then yield on empty queue.
-        let mut msg: IpcMessage = unsafe { core::mem::zeroed() };
-        let ret = unsafe { ipc_recv(&mut msg as *mut IpcMessage as usize) };
+        let mut event: IpcMessage = unsafe { core::mem::zeroed() };
+        let ret = unsafe { ipc_recv(&mut event as *mut IpcMessage as usize) };
         if ret <= 0 {
             // No message available — yield the CPU cooperatively instead of
             // busy-waiting. The timer interrupt brings us back next slice.
@@ -69,11 +69,11 @@ pub extern "C" fn main() -> ! {
             continue;
         }
 
-        match msg.msg_type {
-            // ── MSG_VGA_CHAR (type 1): write a single character ──
+        match event.msg_type {
+            // ── MSG_VGA_CHAR: write a single character ──
             // data[0] = the ASCII byte to display.
-            1 => {
-                let byte = msg.data[0];
+            msg::VGA_CHAR => {
+                let byte = event.data[0];
                 serial_putc(byte);
                 match byte {
                     b'\n' => {
@@ -88,6 +88,17 @@ pub extern "C" fn main() -> ! {
                         let row = cursor / VGA_COLS;
                         cursor = row * VGA_COLS;
                     }
+                    0x08 => {
+                        // Backspace: erase the previous cell and step back.
+                        if cursor > 0 {
+                            cursor -= 1;
+                            let offset = cursor * 2;
+                            unsafe {
+                                core::ptr::write_volatile(vga.add(offset), b' ');
+                                core::ptr::write_volatile(vga.add(offset + 1), ATTR_DEFAULT);
+                            }
+                        }
+                    }
                     _ => {
                         if cursor < VGA_COLS * VGA_ROWS {
                             let offset = cursor * 2;
@@ -100,8 +111,8 @@ pub extern "C" fn main() -> ! {
                     }
                 }
             }
-            // ── MSG_VGA_CLEAR (type 2): clear the entire screen ──
-            2 => {
+            // ── MSG_VGA_CLEAR: clear the entire screen ──
+            msg::VGA_CLEAR => {
                 let mut i = 0;
                 while i < VGA_COLS * VGA_ROWS * 2 {
                     unsafe {
